@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-loop-cli"
-version = "0.1.0"
-description = "Standalone CLI for R→P→I→V→J agent loops with multi-model support via litellm"
+dynamic = ["version"]
+description = "Standalone CLI for the R→P→I→V→J agent loop with multi-model support (Anthropic / OpenAI / Gemini / Ollama via litellm + cursor / claude / gemini CLI subprocess)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -40,8 +40,12 @@ dev = [
 agent-loop = "agent_loop.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/agent-loop/agent-loop-cli"
-Issues = "https://github.com/agent-loop/agent-loop-cli/issues"
+Homepage = "https://github.com/dbscjf0000-web/agent-loop-cli"
+Issues = "https://github.com/dbscjf0000-web/agent-loop-cli/issues"
+Repository = "https://github.com/dbscjf0000-web/agent-loop-cli"
+
+[tool.hatch.version]
+path = "src/agent_loop/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_loop"]
