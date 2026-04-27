@@ -756,6 +756,28 @@ Restart Claude Code; the six tools appear in `/mcp` and Claude can call
 - The server processes one request at a time. Concurrent `agent_loop.run`
   calls from multiple clients are serialized — race-safe but slow.
 - `mcp serve --transport http` exits with code 2 — use stdio for now.
+- **Known issue (v0.5.0)**: the orchestrator's rich progress prints
+  (`>>> Cycle 1/1`, `> research (cycle 1)`, etc.) go to stdout and
+  interleave with JSON-RPC frames during `agent_loop.run`. MCP clients
+  must filter non-JSON lines. To be fixed in v0.5.1 by routing rich
+  Console to stderr when serving over stdio.
+
+### Live verified (2026-04-27)
+
+Real subprocess + JSON-RPC e2e from KISTI Neuron, Python 3.14.2:
+
+- `initialize` -> `serverInfo={'name': 'agent-loop', 'version': '0.5.0', 'agentLoopVersion': '0.5.0'}`
+- `tools/list` -> 6 tools, `resources/list` -> 4 resources
+- `agent_loop.list`, `agent_loop.memory_show` round-trip OK
+- Errors: `resources/read agent-loop://task/missing/solution` -> -32001,
+  unknown method -> -32601, missing `name` -> -32602
+- `agent_loop.run` (cursor for all phases, single cycle) finished in
+  94.3s, returned `{"task_id": "f259b7", "final_status": "stop",
+  "cycles_run": 1, "best_solution_path": "...workspace/best_solution.py"}`
+- Server exits cleanly (rc=0) on stdin EOF.
+
+Verification scripts: `tests/e2e_mcp_subprocess.py` (9 probes) and
+`tests/e2e_mcp_live_run.py` (full live run).
 
 ## Cross-task memory (v0.4)
 

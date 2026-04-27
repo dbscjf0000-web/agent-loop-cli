@@ -125,6 +125,18 @@
   `agent-loop mcp tools` / `agent-loop mcp resources`. handler 분기: `Handlers.dispatch
   (method, params, rid) -> Response` 가 `_PrivacyError`/`_NotFoundError`/`_BadParams
   Error`/일반 Exception 모두 잡아 JSON-RPC error 로 wrap (server loop 절대 안 죽음).
+- ⚠️ v0.5.0 KNOWN BUG (라이브 검증으로 발견, 2026-04-27): orchestrator 의 rich
+  Console (default `Console()`) 가 stdout 으로 progress (`>>> Cycle 1/1`,
+  `> research (cycle 1)`, `judge: better=True ...`) 를 찍음 → MCP stdio 모드
+  에서 JSON-RPC frame 사이에 노이즈 라인이 끼어 client 가 JSON parse 실패. tool
+  call 자체는 성공해서 마지막 줄에 `{"jsonrpc":"2.0",...}` 가 나옴. 클라이언트는
+  `startswith("{")` + json.loads + `id` 매칭으로 필터해야 동작. v0.5.1 수정 후보:
+  `serve_stdio` 가 Orchestrator 에 `Console(file=sys.stderr)` 주입.
+- 라이브 subprocess e2e 검증 패턴: `tests/e2e_mcp_subprocess.py` 9 probes (initialize/
+  tools_list/2 tools_call/resources_list/3 errors/exit), `tests/e2e_mcp_live_run.py`
+  실제 `agent_loop.run` 호출. 실행: `LD_LIBRARY_PATH=/apps/applications/PYTHON/3.14.2/lib
+  /apps/applications/PYTHON/3.14.2/bin/python3 tests/e2e_mcp_subprocess.py`. 두
+  스크립트 모두 pytest 외부에 둠 (실 subprocess + 외부 LLM 의존이라 CI 부적합).
 
 ---
 
@@ -1340,4 +1352,71 @@
   - mock e2e: free-form "Implement gcd(a, b)" 1 cycle → rubric_auto.json (3 axes:
     correctness/edge_cases/code_quality) → solution.json axes list 3개 + weighted_
     score=0.82 (0.9*0.5 + 0.7*0.3 + 0.8*0.2).
+---
+
+## [2026-04-28 00:25] - v0.5 MCP server real subprocess e2e (라이브 검증)
+- 작업:
+  - `tests/e2e_mcp_subprocess.py` 신규 (verification utility, pytest 미수집):
+    실제 `python -m agent_loop.cli mcp serve` subprocess 시작 → stdin 으로
+    JSON-RPC request 전송 → stdout 라인 파싱. 9 probes:
+      [1] initialize → serverInfo `{name: "agent-loop", version: "0.5.0",
+          agentLoopVersion: "0.5.0"}`
+      [2] tools/list → 6 tools (run/list/status/resume/bench/memory_show)
+      [3] tools/call agent_loop.list → `{"root":".agent_loop","tasks":[]}`
+      [4] tools/call agent_loop.memory_show → `{"path":"/home01/.../patterns.md",
+          "lines":[]}` (config default cross_task_memory=True 이므로 통과)
+      [5] resources/list → 4 resources (task/{id}/{solution,memory,metrics} +
+          global/patterns)
+      [6] resources/read `agent-loop://task/missing/solution` → error code
+          -32001 (ERR_NOT_FOUND), msg "task not found: missing"
+      [7] foo/bar → -32601 (ERR_METHOD_NOT_FOUND)
+      [8] tools/call without `name` param → -32602 (ERR_INVALID_PARAMS),
+          msg "'name' must be a string"
+      [end] stdin close → server exit rc=0, stderr empty
+    9/9 OK. stdlib JSON-RPC 구현이 spec 준수 확인.
+  - `tests/e2e_mcp_live_run.py` 신규 (live LLM run, ~95s):
+    `/tmp/al_v05_e2e/config.toml` 작성 (5 phase 모두 cursor/auto, max_cycles=1,
+    max_redo=1, auto_rubric=true). subprocess 시작 → initialize → `tools/call
+    agent_loop.run {task: "Implement is_even(n: int) -> bool ...", cycles: 1,
+    max_redo: 1, cross_task: false}`. 응답 파싱:
+      `{"task_id":"f259b7","cycles_run":1,"final_status":"stop",
+       "best_solution_path":"/tmp/al_v05_e2e/.agent_loop/f259b7/workspace/
+       best_solution.py","total_cost_usd":0.0}`
+    실제 best_solution.py (129B) 작성됨 — `def is_even(n: int) -> bool:
+    return n % 2 == 0`. judge: better=True action=stop score=1.000.
+- 변경 파일:
+  - tests/e2e_mcp_subprocess.py (신규, 187 lines)
+  - tests/e2e_mcp_live_run.py (신규, 161 lines)
+  - README.md ("MCP server (v0.5)" 섹션):
+    - "Caveats" 에 KNOWN ISSUE 추가 (rich Console stdout 오염)
+    - "Live verified (2026-04-27)" 신규 서브섹션 (9 probes + agent_loop.run
+      94.3s 실측 결과 캡처)
+- 발견 (중요):
+  - **v0.5.0 BUG: orchestrator Console 이 stdout 으로 progress 찍음 → MCP
+    JSON-RPC stream 오염.** mock unit test (handlers 직접 호출) 로는 못 잡음.
+    실제 서브프로세스 + JSON-RPC IPC 만 노출. 클라이언트가 line filter
+    구현해야 동작 (Claude Code MCP client 가 그렇게 처리하는지는 미확인 —
+    .mcp.json 등록 시 확인 필요).
+    수정 안: `serve_stdio` 가 `Orchestrator(td, cfg, console=Console(
+    file=sys.stderr))` 주입. v0.5.1 우선순위.
+  - 그 외 모든 spec 동작 정상. error code 매핑 정확. server 종료 깨끗 (rc=0,
+    stderr 비어있음).
+- 상태: 완료
+- 다음 할 일:
+  - v0.5.1 패치: `Orchestrator.__init__` console 인자를 활용해서 `serve_stdio`
+    에서 stderr 로 redirect. 패치 한 줄 + e2e_mcp_live_run.py 재실행 검증.
+  - (선택) `tests/e2e_mcp_subprocess.py` 를 `pytest -m live` 로 marker 붙이고
+    CI 에서 skip — 개발 시 수동 실행만.
+- 학습:
+  - 패턴: subprocess + JSON-RPC e2e 는 `Popen(stdin=PIPE, stdout=PIPE,
+    stderr=PIPE, text=True, bufsize=1)` + line-by-line readline. 응답에 noise
+    가 끼면 `id` 필드로 매칭 (id=100 같은 unique 값 권장).
+  - 주의사항: KISTI 환경에서 `module load python/3.12.4` 는 deprecated 경고
+    내고 3.14.2 redirect 되지만 PATH 가 sub-shell 에 propagate 되지 않을 때
+    있음. 직접 binary 호출 시 `LD_LIBRARY_PATH=/apps/applications/PYTHON/
+    3.14.2/lib` + `/apps/applications/PYTHON/3.14.2/bin/python3` 사용.
+  - 주의사항: rich.Console default 는 stdout. stdio JSON-RPC 서버에서는
+    반드시 stderr (또는 file=open(devnull)) 로 묶어야 함 — agent-loop 만의
+    문제가 아니라 **모든 LLM CLI 가 MCP stdio mode 출시 시 첫번째로 검증할
+    포인트**.
 ---
