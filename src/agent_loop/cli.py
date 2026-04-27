@@ -147,6 +147,13 @@ def _override_runtime_v04(cfg: Config, *, no_cross_task: bool) -> Config:
     return cfg
 
 
+def _override_runtime_v041(cfg: Config, *, no_auto_rubric: bool) -> Config:
+    """v0.4.1 — apply --no-auto-rubric (one-shot opt-out)."""
+    if no_auto_rubric:
+        cfg.runtime.auto_rubric = False
+    return cfg
+
+
 @app.command("run")
 def cmd_run(
     task: str = typer.Argument(..., help="Task description (free-form prose)."),
@@ -194,6 +201,14 @@ def cmd_run(
         "--no-cross-task",
         help="(v0.4) Disable cross-task global memory for this run only (does not modify config).",
     ),
+    no_auto_rubric: bool = typer.Option(
+        False,
+        "--no-auto-rubric",
+        help="(v0.4.1) Disable auto-rubric generation for this run only. "
+        "Free-form tasks will use the legacy single-shot LLM verifier instead "
+        "of the multi-axis Verify Engine. Has no effect on tasks that ship a "
+        "rubric.json (e.g. `bench`).",
+    ),
 ) -> None:
     """Run a fresh task through the loop."""
     if mode not in ("auto", "supervised"):
@@ -210,6 +225,7 @@ def cmd_run(
         judge_always_llm=judge_always_llm,
     )
     cfg = _override_runtime_v04(cfg, no_cross_task=no_cross_task)
+    cfg = _override_runtime_v041(cfg, no_auto_rubric=no_auto_rubric)
     tid = task_id or new_task_id()
     td = TaskDir(root=root, task_id=tid)
     td.init()

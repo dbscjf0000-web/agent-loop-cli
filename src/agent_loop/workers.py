@@ -219,7 +219,64 @@ def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
             "model": resp.model,
         }
     )
+    # v0.4.1 auto-rubric: generate a multi-axis rubric so free-form tasks get
+    # the same multi-axis verify experience as bench (yaml-driven). Skipped
+    # when (a) auto_rubric is disabled, (b) a hand-written rubric already
+    # exists, or (c) a previous cycle already wrote rubric_auto.json.
+    _maybe_generate_auto_rubric(task_dir, config, task, resp.text)
     return resp
+
+
+def _maybe_generate_auto_rubric(
+    task_dir: TaskDir,
+    config: Config,
+    task_text: str,
+    findings_text: str,
+) -> None:
+    """Best-effort auto-rubric generation. Errors are isolated — never raise.
+
+    Writes ``artifacts/rubric_auto.json`` on success. Logs a one-line
+    summary to ``memory/history.jsonl`` so the audit trail captures the
+    extra LLM call. Skips when:
+      - ``runtime.auto_rubric`` is False,
+      - ``artifacts/rubric.json`` already exists (hand-written / yaml),
+      - ``artifacts/rubric_auto.json`` already exists (resume / re-research).
+    """
+    if not getattr(config.runtime, "auto_rubric", True):
+        return
+    if task_dir.has_artifact("rubric.json"):
+        return
+    if task_dir.has_artifact("rubric_auto.json"):
+        return
+
+    try:
+        from agent_loop.auto_rubric import generate_rubric
+
+        rubric = generate_rubric(task_text, findings_text, config)
+    except Exception as e:  # pragma: no cover - defensive
+        ContextEngine(task_dir).append_history(
+            {
+                "cycle": _current_cycle(task_dir),
+                "phase": "research",
+                "summary": f"auto_rubric: skipped ({type(e).__name__}: {e})",
+                "model": "(auto_rubric: failed)",
+                "auto_rubric": False,
+            }
+        )
+        return
+
+    task_dir.write_artifact("rubric_auto.json", rubric)
+    axes = list((rubric.get("axes") or {}).keys())
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "research",
+            "summary": f"auto_rubric: {len(axes)} axes -> {','.join(axes)}",
+            "model": "(auto_rubric)",
+            "auto_rubric": True,
+            "n_axes": len(axes),
+        }
+    )
 
 
 def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
@@ -382,15 +439,21 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
 def run_verify(task_dir: TaskDir, config: Config) -> ModelResponse:
     """Score the latest implementation.
 
-    v0.2 multi-axis rubric path: if ``artifacts/rubric.json`` exists, the
-    Verify Engine drives programmatic evaluators (pytest / benchmark /
-    ast_grep / llm_rubric) and writes a richer ``solution.json``.
-    Otherwise we fall back to the v0.1 single-call LLM verifier
-    (``_run_verify_llm_legacy``).
+    Priority (v0.4.1):
+      1. ``artifacts/rubric.json``       — hand-written / yaml-derived (bench).
+      2. ``artifacts/rubric_auto.json``  — Research-phase auto-generated (free-form).
+                                           Only used when ``runtime.auto_rubric`` True.
+      3. ``_run_verify_llm_legacy``      — single-shot LLM verifier (v0.1 compat).
+
+    Both rubric paths flow through ``VerifyEngine.evaluate`` and write the
+    same v0.2 ``solution.json`` schema.
     """
     rubric_path = task_dir.artifact_path("rubric.json")
     if rubric_path.exists():
         return _run_verify_with_rubric(task_dir, config, rubric_path)
+    auto_path = task_dir.artifact_path("rubric_auto.json")
+    if getattr(config.runtime, "auto_rubric", True) and auto_path.exists():
+        return _run_verify_with_rubric(task_dir, config, auto_path)
     return _run_verify_llm_legacy(task_dir, config)
 
 

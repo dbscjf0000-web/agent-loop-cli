@@ -743,6 +743,84 @@ Environment overrides:
 - `commit_to_global` is **idempotent** for the same `task_id`; `agent-loop resume`
   does not double-count.
 
+## Auto-rubric (v0.4.1)
+
+`agent-loop run "<task>"` (free-form prose, no benchmark YAML) used to fall
+back to a single-shot LLM verifier — one axis, one number, one paragraph of
+evidence. v0.4.1 closes that gap: at the end of the **Research** phase the
+LLM proposes a multi-axis rubric, persisted as `artifacts/rubric_auto.json`,
+which the Verify Engine then drives just like a hand-written / yaml-derived
+rubric.
+
+```bash
+agent-loop run "Implement gcd(a, b) for integers."
+
+# Cycle 1 / Research writes both:
+#   artifacts/findings.md
+#   artifacts/rubric_auto.json     <- NEW
+```
+
+Sample `rubric_auto.json`:
+
+```json
+{
+  "axes": {
+    "correctness": {
+      "weight": 0.5,
+      "evaluator": "llm_rubric",
+      "criterion": "function returns the correct gcd for typical inputs"
+    },
+    "edge_cases": {
+      "weight": 0.3,
+      "evaluator": "llm_rubric",
+      "criterion": "handles zero and negative inputs gracefully"
+    },
+    "code_quality": {
+      "weight": 0.2,
+      "evaluator": "llm_rubric",
+      "criterion": "uses Euclidean algorithm idiomatically"
+    }
+  }
+}
+```
+
+Verify priority order:
+
+1. `artifacts/rubric.json` — hand-written or yaml-derived (`bench`). Always wins.
+2. `artifacts/rubric_auto.json` — Research-generated (free-form `run`). Used when `runtime.auto_rubric=true` (default).
+3. Legacy single-shot LLM verifier — fallback when neither rubric is present.
+
+`solution.json` ends up with the same `axes` *list* + `weighted_score` + `summary`
+schema as a yaml-driven bench, so the Judge phase sees a richer signal across
+cycles.
+
+### Disabling
+
+```bash
+# One-shot opt-out
+agent-loop run "..." --no-auto-rubric
+
+# Permanent: agent-loop.toml
+[runtime]
+auto_rubric = false
+
+# Or env
+export AGENT_LOOP_RUNTIME_AUTO_RUBRIC=false
+```
+
+`bench` is unaffected — yaml-driven `rubric.json` always wins.
+
+### Caveats
+
+- The rubric is generated from `task.md` + `findings.md` only — no code is read,
+  so all axes are `evaluator: "llm_rubric"`. (Code-aware pytest/benchmark axis
+  generation is the v0.4.2 candidate.)
+- Each verify call costs N×LLM rubric calls (one per axis). Default rubric
+  has 3-5 axes, so verify takes ~3-5× the legacy single-shot cost.
+- LLMs are non-deterministic — re-running the same task can produce a slightly
+  different rubric. The rubric lives in `artifacts/rubric_auto.json`; you can
+  edit it before re-running the loop.
+
 ## Configuration
 
 Default location: `~/.agent-loop/config.toml`. Override with `./agent-loop.toml` (project-local)

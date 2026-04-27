@@ -220,3 +220,141 @@ class Runtime(BaseModel):
 2. (v0.4.1) `src/agent_loop/mcp_server.py` 신규 — Model Context Protocol 표준에 맞춰 `tools/list`, `resources/list`, `resources/read` 노출. `commit_to_global` / `_load_global_patterns` 가 read/write 백엔드.
 3. (v0.5) score 가중 retrieval — `task_index.jsonl` 의 weighted_score / cycles 를 활용해 새 task 의 prompt 에 더 관련도 높은 패턴만 inject.
 4. (v0.5+) 글로벌 메모리 dashboard — `agent-loop memory stats` / `agent-loop memory diff <task1> <task2>`.
+
+---
+
+## v0.4.1 Auto-rubric 추가 계획 (post-v0.4.0)
+
+### 1. 문제 (왜 v0.4.1 인가)
+
+`agent-loop run "..."` (free-form prose) 모드에는 `success_criteria` YAML 이
+없으므로 v0.2 Verify Engine 의 다축 rubric 평가가 불가능하다. 결과:
+
+- `bench` 명령(yaml 작성자) → 다축 rubric 평가 (`pytest`/`benchmark`/`ast_grep`/`llm_rubric`).
+- `run "..."` (일반 사용자) → `_run_verify_llm_legacy` 가 **단축 LLM 1콜**만 한다.
+
+가치 격차가 크다. 일반 사용자도 다축 평가의 이점(여러 관점 score, 가중 합산,
+cycle 간 비교 가능한 axis-별 추이)을 누리도록 한다.
+
+### 2. 해결: Research phase 부산물로 자동 rubric
+
+코드를 읽기 전(=task.md만 본 상태)이므로 `pytest`/`benchmark`/`ast_grep` 같이
+실행 가능 평가는 못 만든다. 모든 axis 는 **`llm_rubric`** 으로 작성한다 —
+즉 V phase 에서 axis 별로 짧은 LLM rubric call 을 axes 수만큼 한다.
+실행 가능 평가 자동 생성은 **v0.4.2** 후보 (code-aware: solution.py 파싱 후
+pytest 자동 작성).
+
+### 3. 흐름
+
+```
+사용자: agent-loop run "Implement gcd(a, b)"
+  ↓
+R: research.md 작성  (기존 path 그대로)
+   + (NEW) auto_rubric.generate_rubric(task, findings, cfg) 1회 호출
+   → artifacts/rubric_auto.json 작성
+   schema:
+     {"axes": {
+       "correctness": {weight=0.5, evaluator="llm_rubric",
+                       criterion="returns correct gcd including 0/negatives"},
+       "edge_cases":  {weight=0.3, evaluator="llm_rubric",
+                       criterion="handles 0, negatives, 1 correctly"},
+       "code_quality":{weight=0.2, evaluator="llm_rubric",
+                       criterion="Euclidean algorithm with type hints"},
+     }}
+  ↓
+P → I → V (rubric_auto.json 사용해서 다축 LLM rubric 평가) → J
+```
+
+### 4. Verify phase 우선순위 (확정)
+
+```python
+def run_verify(task_dir, config):
+    rubric = task_dir.artifact_path("rubric.json")
+    if rubric.exists():
+        return _run_verify_with_rubric(td, cfg, rubric)        # backward compat (yaml→rubric)
+    auto = task_dir.artifact_path("rubric_auto.json")           # NEW
+    if config.runtime.auto_rubric and auto.exists():
+        return _run_verify_with_rubric(td, cfg, auto)
+    return _run_verify_llm_legacy(td, cfg)                      # v0.1 호환
+```
+
+`_run_verify_with_rubric` 가 path 인자를 받도록 한다 (이미 v0.4 구현에서
+받는 형태이므로 추가 변경 0). `solution.json` 의 schema 는 v0.2 와 동일.
+
+### 5. 모듈 분리 (옵션 A 채택)
+
+신규 `src/agent_loop/auto_rubric.py` 한 파일 (~150줄):
+
+```python
+def generate_rubric(task_text: str, findings_text: str, config: Config) -> dict:
+    """LLM 에 task+findings 보여주고 rubric JSON 1회 생성.
+    schema: {"axes": {name: {weight, evaluator='llm_rubric', criterion}}}.
+    파싱 실패 시 RuntimeError. weights 합 != 1.0 이면 normalize.
+    axes 1개 이하면 ValueError (single-shot 의미 없음)."""
+    prompt = ...  # task + findings + RUBRIC_SCHEMA_PROMPT
+    resp = call_model("research", prompt, system="You generate JSON rubrics.", config=config)
+    rubric = _extract_json(resp.text)
+    _validate_and_normalize(rubric)
+    return rubric
+```
+
+옵션 B (research worker 가 prompt 안에서 둘 다 요청)를 거부한 이유:
+- prompts/research.md 변경 시 두 산출물(findings + rubric)을 한 응답에 담아야 함 → 파싱 fragile.
+- 책임 분리 원칙 위반 (research = 사실 정리, auto_rubric = 평가 기준).
+- 같은 LLM 응답에 두 산출물 → 한 쪽 파싱 실패시 양쪽 다 잃음.
+
+### 6. Config / CLI / ENV 변경
+
+```python
+class Runtime(BaseModel):
+    ...
+    auto_rubric: bool = True   # default ON for free-form
+```
+
+ENV: `AGENT_LOOP_RUNTIME_AUTO_RUBRIC` (bool).
+CLI: `agent-loop run "..." --no-auto-rubric` (one-shot 끄기).
+
+### 7. Backward compat
+
+- `bench` 명령 (yaml 있음) → 기존 `rubric.json` 우선, auto 생성 skip. 변경 0.
+- `auto_rubric=False` → R phase 에서 `generate_rubric` 호출 X. v0.4.0 동일.
+- `rubric_auto.json` 만 있고 `auto_rubric=False` → verify 가 무시하고 legacy 경로.
+- prompts/*.md 변경 0 (별도 LLM 호출이라 prompt 별도 관리).
+
+### 8. 위험 / 한계
+
+| 위험 | 대응 |
+|---|---|
+| LLM 이 weights 합 ≠ 1.0 / axes < 2 / 잘못된 evaluator 반환 | `_validate_and_normalize` 가 정규화 + 검증. 실패 시 RuntimeError → R 결과는 살리고 verify 는 legacy fallback. |
+| 비결정성 (같은 task → 다른 rubric) | 사용자가 cycle 1 결과 보고 axes 가 마음에 안 들면 `artifacts/rubric_auto.json` 직접 수정 가능 (artifact 는 사용자 소유). |
+| 추가 LLM 호출 1회 (research phase 비용 증가) | metrics.jsonl 에 별도 phase row 안 만들고 research row 의 cost_usd 에 합산 (간단). 또는 별도 `phase: "research_rubric"` row. → 결정: **별도 row** (`phase: "research"` + `auto_rubric: true` flag). 비용 추적 명료. |
+| axes 1개 (single-shot 과 동등) | `_validate_and_normalize` 가 ValueError. legacy fallback. |
+| LLM 이 evaluator 외의 종류(`pytest`, `benchmark`)를 자기 멋대로 시도 | spec 에서 evaluator field 값을 강제로 `"llm_rubric"` 로 덮어쓰기. (LLM 이 `pytest` 코드를 못 만드므로 안전.) |
+
+### 9. 결정 사항 (확정)
+
+- **default ON** — `auto_rubric: bool = True`. 무지한 사용자도 다축 평가 자동.
+- **모든 axis = `llm_rubric`** — code-aware 평가는 v0.4.2 후보.
+- **새 phase 추가 X** — research 의 부산물. metrics 에 별도 row 만 추가.
+- **prompts/*.md 변경 X** — 별도 module(`auto_rubric.py`) 안에 schema prompt 인라인.
+- **dedup 우선순위** — `rubric.json` > `rubric_auto.json` > legacy. yaml 사용자 경험 변경 X.
+- **error isolation** — `generate_rubric` 예외는 console warning 으로 격리. R 산출물(findings.md) 은 살아남음. verify 는 legacy fallback.
+- **axes 최소 2** — single axis rubric 은 single-shot 과 동등하므로 의미 없음.
+
+### 10. 작업 분해
+
+| # | 작업 | 산출물 |
+|---|---|---|
+| 1 | 이 plan append | this section |
+| 2 | `auto_rubric.py` 신규 | core module (~150 lines) |
+| 3 | `workers.py` 수정 | run_research 끝에 generate_rubric 호출 + run_verify 분기 추가 |
+| 4 | `verify_engine.py` 미세 수정 | path 인자 (이미 받음 → 변경 0) |
+| 5 | `config.py` 확장 | Runtime.auto_rubric + ENV |
+| 6 | `cli.py` 확장 | `--no-auto-rubric` flag (run only) |
+| 7 | tests/test_auto_rubric.py | 6 tests |
+| 8 | tests/test_workers_autorubric.py | 4 tests |
+| 9 | tests/test_auto_rubric_e2e.py | 1 mock e2e |
+| 10 | README "Auto-rubric (v0.4.1)" 섹션 | doc |
+| 11 | architecture.md auto_rubric 박스 | doc |
+| 12 | progress.txt + `__version__ = "0.4.1"` | release log |
+

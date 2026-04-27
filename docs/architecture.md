@@ -1,4 +1,4 @@
-# agent-loop-cli — Architecture (v0.4-dev)
+# agent-loop-cli — Architecture (v0.4.1-dev)
 
 This document is a focused extract of `docs/plan-v0.1.md` section 5, plus the v0.2
 Context Engine, the v0.2 multi-axis Verify Engine, the v0.3 multi-judge Judge Engine,
@@ -71,7 +71,8 @@ Engine each dispatch to N parallel ``call_model`` calls via
 | `workers.py` | One pure function per phase. Reads + writes `TaskDir`, calls the model router. **No state across calls.** | `run_research / run_plan / run_implement / run_verify / run_judge` |
 | `models.py` | Single `call_model(phase, prompt, system, config)` entry point. Dispatches CLI model ids (`cursor/<m>`, `claude/<m>`, `gemini/<m>`) to local subprocess adapters (`_call_cursor_cli` / `_call_claude_cli` / `_call_gemini_cli` — no API key, uses each CLI's own login) via the `_cli_provider()` helper; everything else goes to litellm (`_call_litellm`). Tracks tokens / cost / latency; one retry on rate-limit. | `ModelResponse`, `call_model`, `_call_cursor_cli`, `_call_claude_cli`, `_call_gemini_cli` |
 | `context.py` | v0.2 Context Engine. Owns the 3-tier `memory/` layout (`history.jsonl` + `episodic.md` + `core_facts.md`), rule-based Compactor, and sensor heuristics (`duplicate_ratio`, `contradiction_count`, `staleness_age_cycles`, `relevance_score`). Migrates v0.1 `memory.txt` once. No LLM calls. | `ContextEngine`, `MemorySnapshot` |
-| `verify_engine.py` + `evaluators/*` | v0.2 multi-axis Verify Engine. When a task ships a `rubric.json`, drives axes through `pytest_runner` / `benchmark` / `ast_grep` (ground-truth) and `llm_rubric` (soft fallback). Backward compat: rubric absent -> `_run_verify_llm_legacy`. | `VerifyEngine`, `AxisScore`, `VerifyResult`, `yaml_to_rubric` |
+| `verify_engine.py` + `evaluators/*` | v0.2 multi-axis Verify Engine. When a task ships a `rubric.json`, drives axes through `pytest_runner` / `benchmark` / `ast_grep` (ground-truth) and `llm_rubric` (soft fallback). Backward compat: rubric absent -> `_run_verify_llm_legacy`. v0.4.1: `rubric_auto.json` (auto-generated) is the second-priority fallback. | `VerifyEngine`, `AxisScore`, `VerifyResult`, `yaml_to_rubric` |
+| `auto_rubric.py` (v0.4.1) | Generates a multi-axis rubric (`rubric_auto.json`) at the end of the Research phase for free-form tasks. Schema-validates + normalises weights to sum 1.0; rejects single-axis output. All axes use `evaluator: "llm_rubric"` (no code-aware axes yet). One extra LLM call per task; reuses the `research` phase model. | `generate_rubric`, `RUBRIC_SCHEMA_PROMPT` |
 | `judge_engine.py` | v0.3 multi-judge consensus. When `runtime.judges` is non-empty, fans out the same prompt to N providers in parallel (`ThreadPoolExecutor`), aggregates with weighted-majority on `action` / `better` and weighted-average on `weighted_score`. Tie-break: `stop` preferred for action, `False` for better. Partial failure -> partial consensus; total failure -> single fallback with `consensus.fallback=True`. Backward compat: `judges` empty -> `_run_judge_single`. | `JudgeEngine`, `IndividualJudgement`, `ConsensusResult`, `consensus_to_dict` |
 | `strategy_engine.py` | v0.3 multi-strategy plan fan-out. When `runtime.strategies` is non-empty, fans out the **plan** prompt to N providers in parallel and a Selector (heuristic + one LLM rubric call) picks one winner. Heuristic = length / fenced / steps / headers; LLM rubric = `cfg.models.plan` returning `{winner_index, scores}`. Final = `0.6 * llm + 0.4 * structural` (or structural-only on rubric failure). Tie-break: higher `weight`, then lower index. Single proposal -> selector skipped. All-fail -> `AllStrategiesFailed` (no silent fallback). | `StrategyEngine`, `PlanProposal`, `SelectionResult`, `selection_to_dict` |
 | `config.py` | TOML loader (file + env override) + pydantic validation. | `Config`, `Models`, `Budget`, `Runtime` |
@@ -85,10 +86,10 @@ forking a single worker is the recommended extension point.
 
 | Phase | Reads | Writes |
 |---|---|---|
-| Research | `task.md`, `memory.txt` | `artifacts/findings.md` |
+| Research | `task.md`, `memory.txt` | `artifacts/findings.md`; (v0.4.1, optional) `artifacts/rubric_auto.json` |
 | Plan | `task.md`, `memory.txt`, `findings.md` | `artifacts/plan.md` |
 | Implement | `plan.md` (+ `best_solution_summary` if present), `workspace/` | `artifacts/execution_log.md`, `workspace/solution.py` |
-| Verify | `execution_log.md`, `workspace/`, import-check sandbox, *optional* `artifacts/rubric.json` | `artifacts/solution.json` (v0.2: `axes` list + `weighted_score` + `summary`; v0.1 schema still accepted) |
+| Verify | `execution_log.md`, `workspace/`, import-check sandbox, *optional* `artifacts/rubric.json` (v0.2 yaml-derived) or `artifacts/rubric_auto.json` (v0.4.1 auto-generated) | `artifacts/solution.json` (v0.2: `axes` list + `weighted_score` + `summary`; v0.1 schema still accepted) |
 | Judge | `solution.json`, `best_solution.json`, `memory.txt`, redo counter | `artifacts/judge_result.json` |
 
 Per-phase `ModelResponse` (tokens, cost, latency, model name) is appended to
@@ -159,6 +160,15 @@ makes sense (KISS / YAGNI; see `progress.txt`). Future work has known extraction
         |                                    + one-line task summary leave the task dir.
         |                                    enabled by `runtime.cross_task_memory` (default ON)
         |                                    CLI: `agent-loop memory {show,list,wipe,path}`
+        |
+        +-- [DONE v0.4.1] Auto-rubric    -- auto_rubric.generate_rubric() runs at the end of
+        |                                    Research and writes artifacts/rubric_auto.json.
+        |                                    Verify priority: rubric.json > rubric_auto.json
+        |                                    > legacy LLM. All axes are evaluator='llm_rubric'
+        |                                    (code-aware pytest/benchmark axis generation is
+        |                                    a v0.4.2 candidate). Default ON; flag
+        |                                    `--no-auto-rubric` for one-shot opt-out.
+        |                                    src/agent_loop/auto_rubric.py
         |
         +-- (v0.3) LLM Compactor      -- swap rule-based body of context.compact()
         |                                with an LLM-backed summarizer behind same iface

@@ -23,6 +23,8 @@ Environment variables can override individual fields:
   AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY            (v0.4, bool — enable cross-task patterns.md)
   AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_DIR        (v0.4, override ~/.agent-loop/global)
   AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_MAX_CHARS  (v0.4, int — snapshot slice budget)
+  AGENT_LOOP_RUNTIME_AUTO_RUBRIC                  (v0.4.1, bool — auto-generate multi-axis
+                                                   rubric for free-form tasks)
 """
 from __future__ import annotations
 
@@ -119,6 +121,14 @@ class Runtime(BaseModel):
     cross_task_memory: bool = True
     cross_task_memory_dir: str = "~/.agent-loop/global"
     cross_task_memory_max_chars: int = 4000
+
+    # v0.4.1 — auto-rubric. When True (default), free-form ``agent-loop run``
+    # tasks generate a multi-axis ``rubric_auto.json`` at the end of the
+    # Research phase, so Verify can drive a multi-axis evaluation instead of
+    # the single-call legacy LLM verifier. ``rubric.json`` (yaml-derived)
+    # always wins. Set to False to revert to v0.4.0 behaviour (legacy LLM
+    # verifier for free-form tasks).
+    auto_rubric: bool = True
 
     def cli_timeout_for(self, phase: str) -> int:
         """Return the effective subprocess timeout (seconds) for ``phase``.
@@ -227,6 +237,8 @@ _ENV_MAP = {
     ("runtime", "cross_task_memory"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY", "bool"),
     ("runtime", "cross_task_memory_dir"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_DIR", str),
     ("runtime", "cross_task_memory_max_chars"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_MAX_CHARS", int),
+    # v0.4.1 auto-rubric
+    ("runtime", "auto_rubric"): ("AGENT_LOOP_RUNTIME_AUTO_RUBRIC", "bool"),
 }
 
 
@@ -314,6 +326,12 @@ judge_always_llm    = false
 cross_task_memory               = true
 cross_task_memory_dir           = "~/.agent-loop/global"
 cross_task_memory_max_chars     = 4000
+
+# v0.4.1 - auto-rubric: ask the LLM at the end of Research to propose a
+# multi-axis rubric so free-form `agent-loop run "..."` tasks get the same
+# multi-axis Verify experience as bench (yaml-driven). `rubric.json` always
+# wins. Set to false to fall back to the legacy single-shot LLM verifier.
+auto_rubric                     = true
 """
 
 

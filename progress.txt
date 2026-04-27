@@ -94,6 +94,16 @@
   (한 번 끄기). MCP server 는 v0.4.1 에 `commit_to_global`/`_load_global_patterns` hooks
   재사용. Privacy: 코드/prompt 본문 글로벌 X. task_md_first_line 만 (사용자가 첫 줄에
   민감 정보 X 가정).
+- v0.4.1 auto-rubric: `src/agent_loop/auto_rubric.py` 의 `generate_rubric(task, findings,
+  cfg)` 가 R phase 끝에서 별도 `call_model("research", ...)` 1회 호출 → `rubric_auto.json`
+  부산물. `workers.run_verify` 우선순위: `rubric.json` > `rubric_auto.json` > legacy LLM
+  (auto_rubric=False 면 auto_rubric 무시). 모든 axis 는 `evaluator: "llm_rubric"` 강제
+  (LLM 이 task 만 보고 작성하므로 pytest/benchmark 코드 못 만듦; v0.4.2 후보). axes 최소
+  2 + weights 합 1.0 normalize, 단일 axis 또는 weight<=0 거부. error isolation: 파싱/검증
+  실패 시 `findings.md` 는 살리고 verify 만 legacy fallback (warn-and-skip). Config:
+  `Runtime.auto_rubric: bool = True` (default ON). ENV `AGENT_LOOP_RUNTIME_AUTO_RUBRIC=
+  false`. CLI `--no-auto-rubric` (run only — bench 는 yaml 우선이라 무관).
+- auto-rubric 은 R 후 별도 call_model — 우선순위 `rubric.json > rubric_auto.json > legacy`.
 
 ---
 
@@ -1144,4 +1154,56 @@
     verify 외 phase 에도 적용되는지). v0.3 검증의 `claude leg 600s timeout` 한계 해소 여부.
   - cycle 2+ multi-judge 검증 (action=redo_R/redo_P 실제 트리거).
   - 부모가 git commit/push 진행 (워커는 commit 금지).
+---
+
+## [2026-04-27 23:30] - v0.4.1 auto-rubric
+- 구현:
+  - 신규 `src/agent_loop/auto_rubric.py` (~210 lines): `generate_rubric(task, findings, cfg)`,
+    `_extract_json`, `_validate_and_normalize`, `RUBRIC_SCHEMA_PROMPT`. axes>=2 + 모든
+    axis evaluator=llm_rubric 강제 + weights normalize to 1.0.
+  - `workers.py`: `run_research` 끝에 `_maybe_generate_auto_rubric` 호출 (try/except 격리,
+    findings.md 는 살리고 rubric 만 skip). `run_verify` 우선순위 분기 추가:
+    rubric.json > rubric_auto.json (auto_rubric=True 일 때만) > legacy.
+  - `config.py`: `Runtime.auto_rubric: bool = True` + ENV `AGENT_LOOP_RUNTIME_AUTO_RUBRIC`
+    + DEFAULT_TOML 주석.
+  - `cli.py`: `cmd_run` 에 `--no-auto-rubric` flag (one-shot 끄기). `bench` 에는 추가 X
+    (yaml 사용 시 rubric.json 우선이라 의미 없음).
+  - `__init__.py`: `__version__ = "0.4.1"`.
+  - prompts/*.md 변경 X (별도 LLM call 이라 prompt 별도 관리).
+- 변경 파일:
+  - 신규: src/agent_loop/auto_rubric.py (~210 lines), tests/test_auto_rubric.py (~157
+    lines), tests/test_workers_autorubric.py (~210 lines), tests/test_auto_rubric_e2e.py
+    (~110 lines).
+  - 수정: src/agent_loop/workers.py, config.py, cli.py, __init__.py, README.md,
+    docs/architecture.md, docs/plan-v0.4.md, progress.txt.
+- 상태: 완료 (mock 검증, push 미진행).
+- 다음 할 일:
+  - 부모가 git commit/push 진행 (워커는 commit 금지).
+  - 라이브 검증: free-form `agent-loop run "Implement gcd(a, b)"` 로 rubric_auto.json
+    실제 LLM 생성 + V phase 다축 평가 latency / cost 측정.
+  - v0.4.2 후보: code-aware rubric — solution.py 가 한 번 작성된 뒤 (cycle 2 시작 전)
+    rubric_auto.json 을 갱신해서 pytest/benchmark axis 추가. 또는 task 에 sample
+    input/output 이 있으면 R 단계에서 pytest axis 도 자동 생성.
+- 학습:
+  - 패턴: auto-rubric 은 R 의 부산물 (새 phase 추가 X). research 모델 재사용으로 cost
+    면에서도 자연스러움. 실패 시 try/except 로 격리해서 R 결과(findings.md)는 항상
+    살아남음 — warn-and-skip 패턴.
+  - 패턴: rubric 우선순위 `rubric.json > rubric_auto.json > legacy` 로 backward compat
+    완벽 보존. yaml 작성한 사용자 (bench) 는 변화 0, free-form 사용자만 다축 평가 혜택.
+  - 패턴: `_validate_and_normalize` 가 LLM 의 evaluator 키를 강제로 `"llm_rubric"` 으로
+    덮어쓰기 — LLM 이 자기 멋대로 `"pytest"` / `"benchmark"` 시도해도 안전 (코드/벤치
+    소스를 못 만들기 때문).
+  - 주의사항: `_maybe_generate_auto_rubric` 가 외부 except 로 모두 잡으므로 진짜 R
+    실패 (call_model 자체 망가짐) 는 silently 가려질 수 있음. 라이브 검증에서
+    rubric_auto.json 부재 + memory/history.jsonl 의 `auto_rubric: skipped` 메시지로
+    원인 추적해야 함.
+  - 주의사항: 기존 `tests/test_workers.py::test_run_research_writes_findings` 는 auto_
+    rubric=True default 이므로 LLM 호출이 1->2 로 증가하지만 monkeypatch lambda 가
+    invariant 라서 통과. 신규 테스트는 scripted 응답으로 정확한 호출 순서 보장.
+- 검증:
+  - pytest 168 passed (151 baseline + 17 신규: test_auto_rubric.py 9 + test_workers_
+    autorubric.py 7 + test_auto_rubric_e2e.py 1).
+  - mock e2e: free-form "Implement gcd(a, b)" 1 cycle → rubric_auto.json (3 axes:
+    correctness/edge_cases/code_quality) → solution.json axes list 3개 + weighted_
+    score=0.82 (0.9*0.5 + 0.7*0.3 + 0.8*0.2).
 ---
