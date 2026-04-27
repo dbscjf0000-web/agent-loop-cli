@@ -1,8 +1,8 @@
 # agent-loop-cli — Architecture (v0.2)
 
 This document is a focused extract of `docs/plan-v0.1.md` section 5, plus the v0.2
-Context Engine and the locations where v0.3+ components plug in. See
-`docs/plan-v0.2.md` for the Context Engine design rationale.
+Context Engine, the v0.2 multi-axis Verify Engine, and the locations where v0.3+
+components plug in. See `docs/plan-v0.2.md` for design rationale.
 
 ## 1. Layered view
 
@@ -27,32 +27,32 @@ Context Engine and the locations where v0.3+ components plug in. See
               |   run_research / run_plan / run_implement / |
               |   run_verify  / run_judge                   |
               |  src/agent_loop/workers.py                  |
-              +-----+-----------+-----------+---------------+
-                    |           |           |
-   (LLM call)       v           v (memory)  v (file I/O)
-       +-----------------------+ +----------------+ +----------------+
-       |  Model Router         | |  Context Eng.  | |  State Store   |
-       |  (litellm | cursor)   | |  3-tier memory | |  TaskDir       |
-       |  src/.../models.py    | |  src/.../      | |  src/.../      |
-       |                       | |  context.py    | |  state.py      |
-       +-----------+-----------+ +--------+-------+ +--------+-------+
-                   |                      |                  |
-                   v                      v                  v
-       +-----------------------+ +----------------+ +----------------+
-       |  Two provider paths:  | | memory/        | | .agent_loop/   |
-       |   - litellm.completion| |  history.jsonl | |  <id>/         |
-       |     (Anthropic/OpenAI/| |  episodic.md   | |  task.md,      |
-       |      Gemini/Azure/    | |  core_facts.md | |  artifacts/,   |
-       |      Ollama)          | |                | |  workspace/,   |
-       |   - cursor-agent CLI  | |                | |  checkpoints/, |
-       |     (subprocess,      | |                | |  telemetry/    |
-       |      `cursor/<m>`)    | |                | |                |
-       +-----------------------+ +----------------+ +----------------+
+              +-+---------+-----------+-----------+---------+
+                |         |           |           |
+                v         v           v           v
+   +----------------+ +-----------+ +-------+ +------------+
+   | Model Router  | | Context   | | State | | Verify     |
+   | (litellm |    | | Engine    | | Store | | Engine     |
+   |  cursor)      | | 3-tier    | |       | | (v0.2)     |
+   | src/.../      | | memory    | |TaskDir| | rubric +   |
+   | models.py     | | src/.../  | |       | | evaluators/|
+   |               | | context.py| |       | |            |
+   +-------+-------+ +-----+-----+ +---+---+ +-----+------+
+           |               |           |           |
+           v               v           v           v
+   +-----------------+ +-----------+ +--------+ +---------------+
+   | litellm | cursor| | memory/   | |.agent_ | | evaluators/   |
+   | -agent CLI      | |  history  | | loop/  | |  pytest_      |
+   | (subprocess,    | |  .jsonl   | |  <id>/ | |  benchmark    |
+   |  `cursor/<m>`)  | |  episodic | |        | |  ast_grep     |
+   |                 | |  core_    | |        | |  llm_rubric   |
+   |                 | |  facts.md | |        | |               |
+   +-----------------+ +-----------+ +--------+ +---------------+
 ```
 
-Seven modules, four real layers. Three of them (Model Router, Context Engine,
-State Store) are leaves the workers share, not separate hops the orchestrator
-goes through.
+Eight modules, four real layers. Four of them (Model Router, Context Engine,
+State Store, Verify Engine) are leaves the workers share, not separate hops the
+orchestrator goes through. Verify Engine in turn dispatches to ``evaluators/*``.
 
 ## 2. Module responsibilities
 
@@ -63,6 +63,7 @@ goes through.
 | `workers.py` | One pure function per phase. Reads + writes `TaskDir`, calls the model router. **No state across calls.** | `run_research / run_plan / run_implement / run_verify / run_judge` |
 | `models.py` | Single `call_model(phase, prompt, system, config)` entry point. Routes `cursor/...` model ids to the local `cursor-agent` CLI (`_call_cursor_cli`, subprocess, no API key) and everything else to litellm (`_call_litellm`); tracks tokens / cost / latency; one retry on rate-limit. | `ModelResponse`, `call_model`, `_call_cursor_cli` |
 | `context.py` | v0.2 Context Engine. Owns the 3-tier `memory/` layout (`history.jsonl` + `episodic.md` + `core_facts.md`), rule-based Compactor, and sensor heuristics (`duplicate_ratio`, `contradiction_count`, `staleness_age_cycles`, `relevance_score`). Migrates v0.1 `memory.txt` once. No LLM calls. | `ContextEngine`, `MemorySnapshot` |
+| `verify_engine.py` + `evaluators/*` | v0.2 multi-axis Verify Engine. When a task ships a `rubric.json`, drives axes through `pytest_runner` / `benchmark` / `ast_grep` (ground-truth) and `llm_rubric` (soft fallback). Backward compat: rubric absent -> `_run_verify_llm_legacy`. | `VerifyEngine`, `AxisScore`, `VerifyResult`, `yaml_to_rubric` |
 | `config.py` | TOML loader (file + env override) + pydantic validation. | `Config`, `Models`, `Budget`, `Runtime` |
 | `state.py` | All file IO under `.agent_loop/<task-id>/`. Artifacts, checkpoints, metrics, workspace, memory directory. | `TaskDir`, `list_tasks`, `new_task_id` |
 | `prompts/*.md` | Five prompt templates with explicit placeholders rendered by `str.format`. | five files |
@@ -77,7 +78,7 @@ forking a single worker is the recommended extension point.
 | Research | `task.md`, `memory.txt` | `artifacts/findings.md` |
 | Plan | `task.md`, `memory.txt`, `findings.md` | `artifacts/plan.md` |
 | Implement | `plan.md` (+ `best_solution_summary` if present), `workspace/` | `artifacts/execution_log.md`, `workspace/solution.py` |
-| Verify | `execution_log.md`, `workspace/`, import-check sandbox | `artifacts/solution.json` |
+| Verify | `execution_log.md`, `workspace/`, import-check sandbox, *optional* `artifacts/rubric.json` | `artifacts/solution.json` (v0.2: `axes` list + `weighted_score` + `summary`; v0.1 schema still accepted) |
 | Judge | `solution.json`, `best_solution.json`, `memory.txt`, redo counter | `artifacts/judge_result.json` |
 
 Per-phase `ModelResponse` (tokens, cost, latency, model name) is appended to
@@ -126,8 +127,10 @@ makes sense (KISS / YAGNI; see `progress.txt`). Future work has known extraction
         +-- [DONE v0.2] Context Engine -- 3-tier memory + sensors + rule-based Compactor
         |                                  src/agent_loop/context.py
         |
-        +-- (v0.2 next) Verify Engine -- multi-axis rubric scoring
-        |                                currently inlined: workers.py:run_verify
+        +-- [DONE v0.2] Verify Engine  -- multi-axis rubric scoring (pytest /
+        |                                  benchmark / ast_grep / llm_rubric)
+        |                                  src/agent_loop/verify_engine.py
+        |                                  src/agent_loop/evaluators/*
         |
         +-- (v0.3) Judge Strategy     -- multi-judge consensus / cross-vendor voting
         |                                currently single-call: workers.py:run_judge

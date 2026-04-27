@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -293,6 +294,60 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
 
 
 def run_verify(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """Score the latest implementation.
+
+    v0.2 multi-axis rubric path: if ``artifacts/rubric.json`` exists, the
+    Verify Engine drives programmatic evaluators (pytest / benchmark /
+    ast_grep / llm_rubric) and writes a richer ``solution.json``.
+    Otherwise we fall back to the v0.1 single-call LLM verifier
+    (``_run_verify_llm_legacy``).
+    """
+    rubric_path = task_dir.artifact_path("rubric.json")
+    if rubric_path.exists():
+        return _run_verify_with_rubric(task_dir, config, rubric_path)
+    return _run_verify_llm_legacy(task_dir, config)
+
+
+def _run_verify_with_rubric(task_dir: TaskDir, config: Config, rubric_path: Path) -> ModelResponse:
+    """Programmatic + (optional) LLM-rubric evaluation driven by rubric.json."""
+    # Late import to avoid a cycle (verify_engine imports state + config).
+    from agent_loop.verify_engine import VerifyEngine, result_to_dict
+
+    started = time.time()
+    try:
+        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        # malformed rubric -> fall back to legacy
+        return _run_verify_llm_legacy(task_dir, config)
+
+    engine = VerifyEngine(task_dir, config)
+    result = engine.evaluate(rubric)
+    payload = result_to_dict(result)
+    payload["evidence"] = result.summary  # backward-compat surface
+    task_dir.write_artifact("solution.json", payload)
+
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "verify",
+            "summary": _summarize(result.summary),
+            "score": float(result.weighted_score),
+            "model": "(verify_engine: rubric)",
+        }
+    )
+
+    return ModelResponse(
+        text=json.dumps(payload),
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost_usd=0.0,
+        latency_s=round(time.time() - started, 4),
+        model="(verify_engine: rubric)",
+    )
+
+
+def _run_verify_llm_legacy(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """v0.1 single-call LLM verifier. Preserved verbatim for backward compat."""
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     plan = _read_or(task_dir, "plan.md", "(no plan)")
     exec_log = _read_or(task_dir, "execution_log.md", "(no log)")
@@ -351,7 +406,12 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
     if not task_dir.has_artifact("best_solution.json"):
         # First cycle: nothing to compare against.
         sol = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
-        score = sol.get("weighted_score", 0.0) if isinstance(sol, dict) else 0.0
+        # weighted_score is the v0.2 canonical field; v0.1 wrote `score` only.
+        score = (
+            sol.get("weighted_score", sol.get("score", 0.0))
+            if isinstance(sol, dict)
+            else 0.0
+        )
         result = {
             "better": True,
             "action": "stop" if score >= 0.95 else "redo_R",

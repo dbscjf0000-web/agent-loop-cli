@@ -31,6 +31,15 @@
   `metrics.jsonl` 에 `phase: "_cycle_quality"` 행이 추가됨. compact 는 rule-based, LLM 호출 0.
 - v0.1 → v0.2 마이그레이션: `memory.txt` 가 비어 있지 않고 `core_facts.md` 가 비어 있으면 1 회만
   복사 + `memory.txt.v0_1.bak` 백업. `init()` 은 idempotent (resume 안전).
+- v0.2 Verify Engine: `src/agent_loop/verify_engine.py` 의 `VerifyEngine.evaluate(rubric)` 진입점.
+  evaluators/{pytest_runner, benchmark, ast_grep, llm_rubric}.py 4종. `task_dir.artifact_path("rubric.json")`
+  존재 시 `workers.run_verify` 가 자동 분기 (legacy LLM 경로 = `_run_verify_llm_legacy` 보존).
+  `verify_types.py` 의 `AxisScore` / `VerifyResult` 는 dataclass — circular import 회피용.
+- `cli.bench` 가 yaml `success_criteria` → `yaml_to_rubric` → `artifacts/rubric.json` 자동 작성.
+- ast_grep 미니 DSL: `` `tok`_count<=N `` / `` `tok` not_in `` / `` `tok` in `` 만 인식. binary_search.yaml 의
+  rule 도 DSL 형식으로 변환됨.
+- `solution.json` 새 스키마: `{"weighted_score", "summary", "axes": [...]}`. evidence 는 summary 와 동일
+  (legacy 호환). v0.1 `{"score": ...}` 도 judge first-cycle 에서 `weighted_score | score` 폴백 처리.
 
 ---
 
@@ -418,4 +427,114 @@
       이미 디렉토리/파일 있으면 모두 no-op (mkdir exist_ok + touch 안 함). 비용 무시 가능.
     - prompts/*.md 의 `{memory}` placeholder 는 그대로. 새 형식 (`# Episodic ... # Core Facts ...`)
       이 들어가도 prompt 가 그대로 동작 — 호환성 유지.
+---
+
+## [2026-04-27 14:20] - v0.2 다축 Verify Engine (rubric + ground-truth 우선)
+- 구현:
+  - `docs/plan-v0.2.md` 12절 추가 (Verify Engine 설계 + 모듈 구조 + 작업 분해).
+  - `src/agent_loop/verify_types.py` (신규, ~45 줄): `AxisScore`, `VerifyResult` dataclass.
+    `verify_engine.py` ↔ `evaluators/*` 의 circular import 회피 위해 별도 모듈로 추출.
+  - `src/agent_loop/verify_engine.py` (신규, ~150 줄): `VerifyEngine.evaluate(rubric)` —
+    축 별 `evaluators.evaluate_axis` 디스패치 + weighted 산술 + 200char summary cap.
+    `yaml_to_rubric(success_criteria)` — measure→evaluator 추론, benchmark stmt 자동 추출.
+    `result_to_dict(result)` — `solution.json` 스키마 직렬화 헬퍼.
+  - `src/agent_loop/evaluators/__init__.py` (신규, ~80 줄): EVALUATORS registry +
+    `evaluate_axis(name, spec, td, cfg)` 디스패처. evaluator 예외 시 score=0 + evidence
+    (run 깨지지 않음). _GROUND_TRUTH = {pytest, benchmark, ast_grep}.
+  - `src/agent_loop/evaluators/pytest_runner.py` (신규, ~145 줄): assert 라인 단위 실행.
+    `_load_solution()` 이 fresh module 을 sys.modules["solution"] 에 등록 → benchmark setup
+    `from solution import *` 도 동작. assert 별 incremental compile + exec 으로 부분 통과 측정.
+  - `src/agent_loop/evaluators/benchmark.py` (신규, ~150 줄): timeit + median + threshold.
+    measure="wall_clock_seconds" 기본, "speedup_ratio" 면 baseline_stmt 와 비교. 1.0~0 선형 감소
+    (median ≤ threshold = 1.0, ≥ 2*threshold = 0.0).
+  - `src/agent_loop/evaluators/ast_grep.py` (신규, ~115 줄): 미니 DSL —
+    `<token>_count(<=|>=|==)N`, `<token> in`, `<token> not_in`. backtick 으로 token escape.
+    위반 1개당 -0.5 (clip 0..1).
+  - `src/agent_loop/evaluators/llm_rubric.py` (신규, ~120 줄): late import `models.call_model`
+    로 verify phase 모델 호출. JSON 추출 (direct/fence/brace). is_ground_truth=False.
+  - `src/agent_loop/state.py`: `artifact_path(name) -> Path` 헬퍼 추가 (existence 체크 X).
+  - `src/agent_loop/workers.py`: `run_verify` 가 `rubric.json` 검사 후 `_run_verify_with_rubric`
+    분기 → VerifyEngine 호출 → cost_usd=0 + ModelResponse(model="(verify_engine: rubric)") 반환.
+    legacy 경로는 `_run_verify_llm_legacy` 로 그대로 보존. import 에 `time` 추가. judge 의
+    first-cycle 분기에 `weighted_score | score` 폴백 (v0.1 호환).
+  - `src/agent_loop/cli.py`: `bench` 명령에서 yaml 파싱 후 `yaml_to_rubric` →
+    `td.write_artifact("rubric.json", ...)` 자동 생성. `--dry-run` 도 동일.
+  - `benchmarks/binary_search.yaml`: `complexity` axis 의 `rule` 을 DSL 형식
+    (`` `for `_count<=1; `.index(` not_in ``) 으로 정정.
+  - `tests/test_evaluators.py` (11 tests): pytest_runner 통과/부분실패/import 오류,
+    benchmark threshold/선형감소, ast_grep 통과/위반/count rule, llm_rubric monkeypatch,
+    evaluate_axis 의 unknown evaluator + pytest dispatch.
+  - `tests/test_verify_engine.py` (4 tests): legacy 경로 보존 (rubric 없음 → LLM 호출),
+    rubric 경로 (LLM 0회), weighted 산술, empty rubric.
+  - `tests/test_yaml_to_rubric.py` (3 tests): n_queens (pytest+benchmark), binary_search
+    (ast_grep+측정), sort_tuning (speedup_ratio).
+  - `tests/test_verify_e2e.py` (1 test): mock e2e — rubric 작성 → run_verify → solution.json
+    schema (axes list + weighted_score + summary) 검증 + ContextEngine history 기록 확인.
+  - `README.md`: "Verify Engine (v0.2)" 섹션 추가 (4 evaluators 표 + rubric 예시 + solution.json
+    schema). State directory layout 에 `rubric.json` 추가. Roadmap v0.2 항목 갱신.
+  - `docs/architecture.md`: Layered view 박스에 Verify Engine 추가, 모듈 책임표에 verify_engine
+    행, "Where v0.3+ plug in" 의 Verify Engine 항목 [DONE v0.2] 마킹.
+- 변경 파일:
+  - 신규: src/agent_loop/{verify_types.py, verify_engine.py},
+    src/agent_loop/evaluators/{__init__.py, pytest_runner.py, benchmark.py, ast_grep.py, llm_rubric.py},
+    tests/{test_evaluators.py, test_verify_engine.py, test_yaml_to_rubric.py, test_verify_e2e.py}
+  - 수정: src/agent_loop/{state.py, workers.py, cli.py}, benchmarks/binary_search.yaml,
+    README.md, docs/{architecture.md, plan-v0.2.md}, progress.txt
+- 상태: 완료. v0.2 Verify Engine 트랙 끝. 합쳐서 v0.2 Context+Verify 둘 다 release ready.
+- 검증:
+  - `python3 -m pytest tests/ -v` → **63 passed in 4.62s** (이전 44 + 새 19, regression 0).
+  - `python3 -m agent_loop.cli bench --dry-run --root /tmp/al_v0_2 binary_search` → task.md +
+    `artifacts/rubric.json` 정상 작성 확인 (correctness=pytest weight 0.7, complexity=ast_grep
+    weight 0.3).
+  - 각 evaluator 단위 검증: pytest=assert 카운트, benchmark=median vs threshold (sleep(0.05)
+    vs threshold=0.01 케이스에서 score < 1.0 확인), ast_grep=DSL 파싱 + count 룰, llm_rubric=
+    `call_model` monkeypatch + JSON 파싱.
+  - `solution.json` 새 schema 직렬화 검증 (test_run_verify_with_rubric_no_llm): axes list +
+    weighted_score + summary (200 char cap) + is_ground_truth flag + ModelResponse cost=0.
+  - mock e2e (test_verify_e2e): rubric.json → run_verify → no LLM call (boom-on-call) →
+    solution.json + history.jsonl 둘 다 정상 기록.
+  - **commit/push 안 함** (작업 지시 명시).
+- 알려진 한계 / 다음 워커 (Z 트랙) 가 알아야 할 함정:
+  1. **`pytest_runner._load_solution` 이 sys.modules["solution"] 을 덮어씀** — 같은 프로세스에서
+     서로 다른 task 의 verify 가 연달아 돌면 가장 최근 task 의 solution.py 가 보임.
+     v0.2 mock 테스트에선 문제 없으나, multi-task 병렬 (v0.3 candidate) 도입 시 격리 필요.
+     해법 후보: subprocess fork + ProcessPoolExecutor 격리.
+  2. **benchmark evaluator 는 같은 프로세스에서 timeit** — sleep / 무한루프 등이 verify 전체를
+     멈출 수 있음. spec.timeout 은 elapsed 측정용이지 실제 SIGALRM 같은 강제 종료 아님.
+  3. **ast_grep DSL 은 substring 카운팅** — 정규식이 아니라 파이썬 ast 분석이 아니라.
+     `` `for ` `` (공백 포함) 같이 공백을 token 에 포함시켜야 함수 정의의 `for_` 같은 false match 회피.
+     binary_search.yaml 가 그렇게 작성됨.
+  4. **`yaml_to_rubric` 의 stmt 추론은 첫 paren-call 정규식만** — 복잡한 target 문장 (예:
+     "fn(13) on a single CPU core" → fn(13) 추출 OK, 하지만 "after fn(); fn2(10)" 같은
+     다중 호출 문장은 첫 거 잡음). YAML 작성자가 의도하는 stmt 와 다르면 `stmt` 명시 권장.
+  5. **`_run_verify_with_rubric` 은 rubric.json 파싱 실패 시 legacy 경로로 폴백** — 잘못된
+     JSON 이 silent 하게 LLM 경로로 떨어질 수 있음. v0.3 에 명시적 경고 + telemetry 추가 후보.
+  6. **llm_rubric 은 verify-phase 모델을 그대로 사용** — config.models.verify 가 cursor/auto
+     라면 rubric axis 마다 cursor-agent 30~120s 호출 발생. weight 가 큰 ground-truth axis 와
+     섞여 있으면 verify 단계 latency 가 한 axis 당 1+ min 늘어날 수 있음. axis 별 model
+     override 는 v0.3.
+  7. **judge `weighted_score | score` 폴백은 first-cycle 만** — 두 번째 사이클부터는 LLM judge
+     가 직접 solution.json 을 읽어 비교하므로 v0.1 schema 라도 prompt 에 그대로 들어감 (judge
+     는 본문 비교라 schema 차이 흡수). prompt template 변경 없음.
+- 학습:
+  - 패턴:
+    - dataclass-only 모듈 (`verify_types.py`) 분리는 evaluator ↔ engine ↔ workers 사이의
+      circular import 깨는 가장 가벼운 방법. ABC 하나도 안 쓰고도 충분.
+    - rubric 분기 추가는 항상 "기존 함수 본체 → `_legacy` 헬퍼로 옮기고 entry point 만 분기"
+      패턴이 가장 안전. `run_verify` → `_run_verify_with_rubric` / `_run_verify_llm_legacy`.
+    - evaluator 함수 시그니처를 `(*, name, spec, task_dir, config)` keyword-only 로 통일하면
+      registry 디스패치 + future params 추가가 쉬움.
+    - `task_dir.artifact_path(name)` 헬퍼는 has/read/write 보다 작은 빌딩 블록 — 새 엔진 추가 시
+      자기 artifact 만 read/write 하는 패턴에 유용 (rubric.json, future cache.json 등).
+    - benchmark setup 의 `from solution import *` 는 sys.modules["solution"] 에 fresh module
+      을 register 하면 동작. 대안 (exec("import solution; ...") 강제 import) 보다 깨끗.
+  - 주의사항:
+    - `pyproject.toml` 의 `[tool.hatch.build.targets.wheel].packages = ["src/agent_loop"]` 만으로
+      sub-package `evaluators/` 도 자동 포함됨 (hatchling 동작). 별도 추가 entry 불필요.
+    - 기존 prompts/verify.md 는 legacy 경로에서만 사용됨 — rubric 경로는 prompt 안 씀.
+      v0.3 에 rubric 결과를 prompt 에 다시 주입하는 hybrid 옵션 검토 가치 있음.
+    - `solution.json` schema 변경 (dict -> {axes: list}) 으로 best_solution.json 에 v0.1 schema 가
+      promote 된 경우 다음 cycle 에서 LLM judge 가 prompt 에서 양쪽을 다 읽음.
+      `judge.md` 가 두 schema 모두 처리하도록 prose 가 일반적이라 호환됨 (직접 axes/score 키 lookup
+      하지 않고 두 객체를 비교하라는 지시).
 ---

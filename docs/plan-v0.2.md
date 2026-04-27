@@ -199,3 +199,66 @@ class TaskDir:
    별도 모듈로 분리, ContextEngine 의 `core_facts.md` 에 axes 별 누적 hint 를 쓰도록 연결.
 3. (v0.3) Compactor 옵션 B (LLM 기반) + sensor 의 LLM-backed `contradiction_count`,
    `relevance_score` 활성화.
+
+## 12. Verify Engine 추가 (v0.2 두 번째 트랙, 워커 #2)
+
+### 12.1 목표 (한 문장)
+v0.1 단일 LLM verify 호출을 **rubric 기반 다축 평가**로 교체하되, programmatic
+evaluator (pytest/benchmark/ast_grep) 를 ground truth 로 우선시하고 LLM rubric 은
+soft fallback 으로 둔다. v0.1 task 는 그대로 (rubric 없으면 legacy 경로).
+
+### 12.2 모듈 구조
+```
+src/agent_loop/
+├── verify_types.py          # AxisScore, VerifyResult dataclasses (cycle-free)
+├── verify_engine.py         # VerifyEngine + yaml_to_rubric
+└── evaluators/
+    ├── __init__.py          # EVALUATORS registry + evaluate_axis dispatch
+    ├── pytest_runner.py     # assert 라인 단위 pass/total
+    ├── benchmark.py         # timeit + median + threshold linear falloff
+    ├── ast_grep.py          # 미니 DSL (count/in/not_in)
+    └── llm_rubric.py        # call_model(verify) 후 JSON 파싱
+```
+
+### 12.3 데이터 클래스 (verify_types.py)
+- `AxisScore(name, score 0..1, weight, evaluator, evidence, is_ground_truth, raw?)`
+- `VerifyResult(axes: list[AxisScore], weighted_score, summary)` — summary 는 200 char cap.
+
+### 12.4 VerifyEngine 동작
+- `evaluate(rubric)` → 모든 axis 를 `evaluators.evaluate_axis` 로 디스패치.
+- weighted_score = Σ(score × weight) / Σ(weight). axis 가 없으면 0.0 + summary "no axes evaluated".
+- 각 evaluator 는 예외 시 score=0 + evidence (run 깨지지 않음).
+
+### 12.5 워커 통합 (`workers.py`)
+- `run_verify` 가 `task_dir.artifact_path("rubric.json")` 검사 → 있으면 `_run_verify_with_rubric`
+  → `VerifyEngine.evaluate` → `solution.json` 에 axes/weighted_score/summary 저장 + ContextEngine
+  history append (LLM 호출 0).
+- 없으면 `_run_verify_llm_legacy` (v0.1 본체 그대로 보존).
+- ModelResponse(model="(verify_engine: rubric)", cost=0, latency=실측) 반환.
+
+### 12.6 cli.py 변경
+- `bench` 명령에서 yaml `success_criteria` → `yaml_to_rubric` → `td.write_artifact("rubric.json", ...)`.
+- 다른 명령은 변경 없음.
+
+### 12.7 yaml_to_rubric 매핑
+- `measure: wall_clock_seconds`/`speedup_ratio` → `benchmark`
+- `measure: source_inspection` → `ast_grep`
+- `test:` 있음 → `pytest`
+- `rule:` 있음 → `ast_grep`
+- 그 외 → `llm_rubric`
+- benchmark `stmt` 미지정 시 `target` 에서 첫 `name(...)` 정규식 추출.
+
+### 12.8 backward compat
+- v0.1 솔루션 `{"score": ...}` 도 judge first-cycle 분기에서 `weighted_score` 우선,
+  fallback `score` (workers.run_judge).
+- legacy 경로는 schema 변경 없이 보존.
+
+### 12.9 새 테스트
+- `tests/test_evaluators.py` (11): pytest 통과/부분실패/import 오류, benchmark threshold/감소, ast_grep
+  통과/위반/count, llm_rubric monkeypatch, evaluate_axis dispatch (unknown / pytest).
+- `tests/test_verify_engine.py` (4): legacy 경로 (no rubric), rubric 경로 (no LLM), weighted 산술,
+  empty rubric.
+- `tests/test_yaml_to_rubric.py` (3): n_queens (pytest+benchmark), binary_search (ast_grep),
+  sort_tuning (speedup_ratio).
+- `tests/test_verify_e2e.py` (1): mock e2e — rubric 작성 → run_verify → solution.json
+  schema + ContextEngine history 기록 검증.

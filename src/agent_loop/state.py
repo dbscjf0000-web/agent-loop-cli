@@ -104,6 +104,14 @@ class TaskDir:
     def has_artifact(self, name: str) -> bool:
         return (self._artifacts_dir() / name).exists()
 
+    def artifact_path(self, name: str) -> Path:
+        """Absolute path to an artifact by name (does not require existence).
+
+        Used by v0.2+ engines (e.g. VerifyEngine) that want to read or write
+        a known artifact without first calling ``has_artifact``.
+        """
+        return self._artifacts_dir() / name
+
     # --- metrics ---------------------------------------------------------
     def append_metric(self, record: dict[str, Any]) -> None:
         record = {"ts": time.time(), **record}

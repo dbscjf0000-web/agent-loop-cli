@@ -30,9 +30,7 @@ success_criteria:
     weight: 0.3
     target: "must use O(log n) approach (no linear scan, no .index())"
     measure: source_inspection
-    rule: |
-      "for " count <= 1 in implementation
-      ".index(" not in implementation
+    rule: "`for `_count<=1; `.index(` not_in"
 
 budget:
   max_cycles: 3

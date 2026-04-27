@@ -244,7 +244,8 @@ Every task gets its own directory under `--root` (default `./.agent_loop/`):
 │   ├── findings.md               # R output
 │   ├── plan.md                   # P output
 │   ├── execution_log.md          # I output
-│   ├── solution.json             # V output (rubric scores)
+│   ├── rubric.json               # V input (v0.2 multi-axis Verify Engine; optional)
+│   ├── solution.json             # V output (axes list + weighted_score in v0.2)
 │   ├── best_solution.json        # Promoted by Judge on improvement
 │   └── judge_result.json         # J output (better/action/scores)
 └── telemetry/
@@ -290,6 +291,75 @@ flag.
 The v0.2 Compactor and `contradiction_count` sensor are intentionally rule-based
 and LLM-free; v0.3 swaps in optional LLM-backed implementations behind the same
 `ContextEngine` interface.
+
+## Verify Engine (v0.2)
+
+The Verify phase used to be a single LLM call returning a JSON of axes. v0.2
+adds a multi-axis rubric driven by **programmatic ground-truth evaluators**;
+LLM rubrics survive only as a soft fallback.
+
+If the task directory contains `artifacts/rubric.json`, `run_verify` calls the
+Verify Engine instead of an LLM. Each axis is dispatched to one of four
+evaluators:
+
+| Evaluator | Spec keys | Score semantics |
+|---|---|---|
+| `pytest`     | `weight`, `test` (or `test_file`)     | `passed/total` of `assert` lines; import error -> 0.0 |
+| `benchmark`  | `weight`, `stmt`, `threshold`, `repeats?`, `measure?` (`wall_clock_seconds` / `speedup_ratio` + `baseline_stmt`) | 1.0 if median <= threshold, linearly down to 0 at 2*threshold |
+| `ast_grep`   | `weight`, `rule` (mini-DSL: `` `tok`_count<=N`` / `` `tok` not_in`` / `` `tok` in``) | starts at 1.0, -0.5 per violated rule (clipped) |
+| `llm_rubric` | `weight`, `criterion`                 | LLM returns `{score, evidence}` JSON; **not** ground truth |
+
+`weighted_score = Σ(score * weight) / Σ(weight)`. Programmatic axes are
+flagged `is_ground_truth: true` so the Judge / sensors can prefer them
+over LLM rubrics.
+
+Example `rubric.json`:
+
+```jsonc
+{
+  "axes": {
+    "correctness": {
+      "evaluator": "pytest", "weight": 0.5,
+      "test": "assert n_queens_count(8) == 92\nassert n_queens_count(13) == 73712"
+    },
+    "performance": {
+      "evaluator": "benchmark", "weight": 0.3,
+      "stmt": "n_queens_count(13)", "threshold": 1.5, "repeats": 3,
+      "measure": "wall_clock_seconds"
+    },
+    "complexity": {
+      "evaluator": "ast_grep", "weight": 0.2,
+      "rule": "`for `_count<=2; `.index(` not_in"
+    }
+  }
+}
+```
+
+Resulting `solution.json` schema:
+
+```jsonc
+{
+  "weighted_score": 0.85,
+  "summary": "correctness=1.00 performance=0.70 complexity=1.00 -> 0.850",
+  "axes": [
+    {"name": "correctness", "score": 1.0, "weight": 0.5,
+     "evaluator": "pytest", "evidence": "10/10 assertions passed",
+     "is_ground_truth": true,
+     "raw": {"passed": 10, "total": 10, "elapsed_s": 0.014}},
+    {"name": "performance", "score": 0.7, "weight": 0.3,
+     "evaluator": "benchmark", "evidence": "median=1.78s, threshold<=1.500s",
+     "is_ground_truth": true,
+     "raw": {"times_s": [1.81, 1.78, 1.77], "median_s": 1.78, "threshold": 1.5}},
+    ...
+  ]
+}
+```
+
+`agent-loop bench <name>` automatically converts each benchmark YAML's
+`success_criteria` into a rubric via `verify_engine.yaml_to_rubric` and
+writes it to `artifacts/rubric.json` before the loop starts. Tasks
+without a rubric still run the legacy v0.1 LLM verifier — full backward
+compatibility.
 
 ## Benchmarks
 
@@ -374,9 +444,10 @@ or never started it via `run`, recreate `task.md` manually before resuming.
 
 - **v0.1.1** — `cursor-agent` CLI added as a second provider next to litellm,
   plus `agent-loop doctor` and `agent-loop test-model` for environment sanity checks.
-- **v0.2 (current, partial)** — Context Engine: 3-tier memory + rule-based Compactor +
-  sensor metrics in `metrics.jsonl`. v0.1 `memory.txt` migrates automatically. Multi-axis
-  Verify rubric is the next milestone (separate worker).
+- **v0.2 (current)** — Context Engine: 3-tier memory + rule-based Compactor + sensor
+  metrics in `metrics.jsonl` (v0.1 `memory.txt` migrates automatically). **Multi-axis
+  Verify Engine**: rubric-driven `pytest` / `benchmark` / `ast_grep` evaluators with
+  `llm_rubric` fallback; benchmarks write `rubric.json` automatically.
 - **v0.3** — LLM-backed Compactor, multi-judge consensus, multi-strategy parallel
   planning, model-router cost optimization.
 - **v0.4** — MCP server mode, cross-task memory, external sensors / tool plugins.

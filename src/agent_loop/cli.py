@@ -198,6 +198,13 @@ def cmd_bench(
         td = TaskDir(root=root, task_id=f"bench-{n}-{tid}")
         td.init()
         td.task_md_path().write_text(task_text, encoding="utf-8")
+        # v0.2: persist a rubric.json next to the task so VerifyEngine drives the V phase.
+        crit = spec.get("success_criteria") or []
+        if crit:
+            from agent_loop.verify_engine import yaml_to_rubric
+
+            rubric = yaml_to_rubric(crit)
+            td.write_artifact("rubric.json", rubric)
         console.print(f"[bold cyan][run][/bold cyan] benchmark={n} task_id={td.task_id}")
 
         if dry_run:
