@@ -402,6 +402,57 @@ For multi-vendor consensus runs that include claude, set a higher
 `cli_timeout` or expect to lose the claude leg to error (consensus still works
 on the surviving 2 vendors with `fallback=false`).
 
+#### v0.3.2 patch verified (2026-04-27): claude tool-block dodges self-invoke timeout
+
+The "claude/default 600 s timeout on free-form Verify/judge prompts" limitation
+above is **resolved**. Root cause: `claude --print` is itself agentic and on
+long prompts the model decides to recursively self-invoke its own tools (Read,
+Bash, etc.), blowing past the timeout even on `--dangerously-skip-permissions`.
+
+**Patch.** `_call_claude_cli` now blocks all tools via a phantom name and pins
+the workspace to the flag with the equals form (so `nargs='*'` on
+`--allowedTools` cannot swallow the workspace path):
+
+```python
+cmd = [
+    binary, "--print",
+    "--output-format", "text",
+    "--dangerously-skip-permissions",
+    "--allowedTools=NoneSuch",     # phantom tool blocks self-invoke
+    f"--add-dir={workspace}",      # equals form keeps it bound
+    rendered_prompt,
+]
+```
+
+**Live cross-vendor re-verification** (`task_id=54c997`, free-form
+`is_palindrome(s: str)`, `cursor` × 3 + `claude/default` verify +
+`gemini-2.5-flash` judge with `judge_always_llm = true`):
+
+| phase     | latency  | model                    | LLM ran?               |
+|-----------|----------|--------------------------|------------------------|
+| research  |  24.36 s | cursor/auto              | yes (293/336 tokens)   |
+| plan      |  17.88 s | cursor/auto              | yes (611/403 tokens)   |
+| implement |  12.61 s | cursor/auto              | yes (727/160 tokens)   |
+| verify    | **14.61 s** | **claude/default**       | **yes (920/175 tokens)** — analytic evidence: *"two-pointer implementation… Time O(n/2), space O(1)"* |
+| judge     |  48.08 s | gemini/gemini-2.5-flash  | yes (515/66 tokens)    — `judge_always_llm` cycle-1 LLM call |
+| **total** | **~2 min** |                        |                        |
+
+`weighted_score=0.975`, `final_status=stop`, `cycles_run=1`. The claude verify
+leg returned in 14.6 s with substantive code analysis — proving the tool-block
+patch lets free-form claude verify actually run end-to-end on cycle 1, with
+`judge_always_llm` forcing a real gemini judge LLM call on top.
+
+**Before / after**:
+
+| scenario                          | before patch | after patch (v0.3.2) |
+|-----------------------------------|--------------|----------------------|
+| `claude --print` short ping       | 10.3 s       | **7.1 s**            |
+| `claude/default` free-form verify | 600 s timeout (`RuntimeError`) | **14.6 s** |
+| `claude/default` plan/judge prompts in multi-vendor consensus | 600 s timeout (graceful degrade to surviving 2) | expected ≤ 60 s (untested in this run, but same patch path) |
+
+The fix unblocks `verify = "claude/default"` for free-form `agent-loop run`
+without raising `cli_timeout` or swapping verifiers.
+
 ## Multi-judge consensus (v0.3)
 
 The single LLM judge of v0.1/v0.2 can be replaced with **N parallel judges + weighted-majority

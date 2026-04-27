@@ -111,7 +111,12 @@ def test_call_claude_cli_success_returns_model_response(monkeypatch: pytest.Monk
     assert "--print" in cmd
     assert "--output-format" in cmd and cmd[cmd.index("--output-format") + 1] == "text"
     assert "--dangerously-skip-permissions" in cmd
-    assert cmd[cmd.index("--add-dir") + 1] == "/tmp/ws"
+    # v0.3.2: tool-block via phantom name to dodge nargs='*' trap and prevent
+    # self-invoke timeouts on long prompts (verify/judge).
+    assert "--allowedTools=NoneSuch" in cmd
+    # v0.3.2: --add-dir uses the equals form to keep the workspace bound to
+    # the flag (avoids being swallowed by --allowedTools' nargs='*').
+    assert "--add-dir=/tmp/ws" in cmd
     # Last arg is the rendered prompt with system header.
     assert cmd[-1].startswith("# System")
     assert "be brief" in cmd[-1]
@@ -167,5 +172,7 @@ def test_call_model_routes_claude_through_cli(monkeypatch: pytest.MonkeyPatch) -
     assert resp.model == "claude/default"
 
     cmd = captured["cmd"]
-    assert "/tmp/agent-ws" in cmd  # workspace flag was forwarded
-    assert "--add-dir" in cmd
+    # v0.3.2: workspace forwarded via --add-dir=<ws> equals form to avoid
+    # nargs='*' eating it after --allowedTools.
+    assert "--add-dir=/tmp/agent-ws" in cmd
+    assert "--allowedTools=NoneSuch" in cmd

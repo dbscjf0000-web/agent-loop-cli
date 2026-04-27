@@ -238,10 +238,11 @@ def _call_claude_cli(
 ) -> ModelResponse:
     """Invoke the local `claude` CLI (Claude Code) in non-interactive mode.
 
-    Uses ``--print --output-format text --dangerously-skip-permissions --bare``.
-    The ``--bare`` flag isolates the spawned Claude Code from user plugins,
-    hooks, and CLAUDE.md context for predictable behavior; ``--add-dir`` brings
-    the workspace into reach.
+    Uses ``--print --output-format text --dangerously-skip-permissions
+    --allowedTools=NoneSuch``. The phantom tool name forces Claude Code into
+    plain-LLM mode (no tool calls, no agentic self-invoke) so verify/judge
+    prompts return in seconds instead of minutes; ``--add-dir`` brings the
+    workspace into reach for context.
 
     The user's Claude Code login is reused — no API key required.
     cost_usd is reported as 0 because subscription billing is opaque.
@@ -265,9 +266,10 @@ def _call_claude_cli(
         "--output-format",
         "text",
         "--dangerously-skip-permissions",
+        "--allowedTools=NoneSuch",
     ]
     if workspace is not None:
-        cmd.extend(["--add-dir", str(workspace)])
+        cmd.extend([f"--add-dir={workspace}"])
     cmd.append(rendered)
 
     started = time.monotonic()
