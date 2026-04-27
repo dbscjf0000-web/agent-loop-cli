@@ -113,17 +113,38 @@ class Orchestrator:
             for phase in phases_to_run:
                 resp = self._run_phase(phase, cycle)
                 total_cost += resp.cost_usd
-                self.task_dir.append_metric(
-                    {
-                        "cycle": cycle,
-                        "phase": phase,
-                        "tokens_in": resp.prompt_tokens,
-                        "tokens_out": resp.completion_tokens,
-                        "cost_usd": resp.cost_usd,
-                        "latency_s": resp.latency_s,
-                        "model": resp.model,
-                    }
-                )
+                metric = {
+                    "cycle": cycle,
+                    "phase": phase,
+                    "tokens_in": resp.prompt_tokens,
+                    "tokens_out": resp.completion_tokens,
+                    "cost_usd": resp.cost_usd,
+                    "latency_s": resp.latency_s,
+                    "model": resp.model,
+                }
+                # v0.3: surface multi-judge consensus stats on the judge metric row.
+                if phase == "judge" and self.task_dir.has_artifact("judge_result.json"):
+                    jr = self.task_dir.read_artifact("judge_result.json")
+                    if isinstance(jr, dict) and isinstance(jr.get("consensus"), dict):
+                        cs = jr["consensus"]
+                        metric["n_judges"] = cs.get("n_judges")
+                        metric["votes_action"] = cs.get("votes_action")
+                        metric["votes_better"] = cs.get("votes_better")
+                        metric["consensus_fallback"] = cs.get("fallback", False)
+                # v0.3: surface multi-strategy selector stats on the plan metric row.
+                if phase == "plan" and self.task_dir.has_artifact("plan_selector.json"):
+                    ps = self.task_dir.read_artifact("plan_selector.json")
+                    if isinstance(ps, dict):
+                        scores = ps.get("scores")
+                        metric["n_strategies"] = (
+                            len(scores) if isinstance(scores, list) else None
+                        )
+                        metric["selector_method"] = ps.get("selector_method")
+                        metric["winner_index"] = ps.get("winner_index")
+                        metric["winner_provider"] = ps.get("winner_provider")
+                        if ps.get("selector_method") == "fallback":
+                            metric["selector_fallback"] = True
+                self.task_dir.append_metric(metric)
                 self.task_dir.save_checkpoint(
                     cycle,
                     phase,

@@ -11,6 +11,8 @@ Environment variables can override individual fields:
   AGENT_LOOP_MODEL_VERIFY, AGENT_LOOP_MODEL_JUDGE
   AGENT_LOOP_BUDGET_DAILY_USD, AGENT_LOOP_BUDGET_PER_RUN_USD
   AGENT_LOOP_RUNTIME_SANDBOX, AGENT_LOOP_RUNTIME_MAX_CYCLES, AGENT_LOOP_RUNTIME_MAX_REDO
+  AGENT_LOOP_RUNTIME_JUDGES        (v0.3, comma-sep providers, weight=1.0 each)
+  AGENT_LOOP_RUNTIME_STRATEGIES    (v0.3, comma-sep providers, weight=1.0 each)
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 if sys.version_info >= (3, 11):
     import tomllib as _toml
@@ -44,10 +46,84 @@ class Budget(BaseModel):
     per_run_usd: float = 2.0
 
 
+class JudgeSpec(BaseModel):
+    """v0.3 multi-judge entry — one provider + weight."""
+
+    provider: str
+    weight: float = 1.0
+
+    @field_validator("weight")
+    @classmethod
+    def _weight_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"judge weight must be > 0 (got {v})")
+        return float(v)
+
+
+class StrategySpec(BaseModel):
+    """v0.3 multi-strategy plan entry — one provider + weight (selector tie-break)."""
+
+    provider: str
+    weight: float = 1.0
+
+    @field_validator("weight")
+    @classmethod
+    def _weight_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"strategy weight must be > 0 (got {v})")
+        return float(v)
+
+
 class Runtime(BaseModel):
     sandbox: bool = True
     max_cycles: int = 10
     max_redo: int = 3
+    # v0.3 multi-judge consensus. None / empty list -> single-judge mode.
+    judges: list[JudgeSpec] | None = None
+    # v0.3 multi-strategy plan fan-out. None / empty list -> single-plan mode.
+    strategies: list[StrategySpec] | None = None
+
+    @field_validator("judges", mode="before")
+    @classmethod
+    def _normalize_judges(cls, v: Any) -> Any:
+        """Accept three input shapes:
+
+        - None / missing               -> None (single-judge mode)
+        - list[str]                    -> [JudgeSpec(provider=s, weight=1.0)]
+        - list[dict] / list[JudgeSpec] -> passed through, validated below
+        - empty list                   -> None (single-judge mode)
+        """
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise TypeError("runtime.judges must be a list")
+        if not v:
+            return None
+        out: list[Any] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append({"provider": item, "weight": 1.0})
+            else:
+                out.append(item)
+        return out
+
+    @field_validator("strategies", mode="before")
+    @classmethod
+    def _normalize_strategies(cls, v: Any) -> Any:
+        """Same normalization as ``_normalize_judges`` but for strategies."""
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise TypeError("runtime.strategies must be a list")
+        if not v:
+            return None
+        out: list[Any] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append({"provider": item, "weight": 1.0})
+            else:
+                out.append(item)
+        return out
 
 
 class Config(BaseModel):
@@ -103,6 +179,29 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         if raw is None:
             continue
         data.setdefault(section, {})[key] = _coerce(raw, kind)
+
+    # v0.3 multi-judge: comma-separated provider list -> [{provider, weight=1}, ...]
+    raw_j = os.environ.get("AGENT_LOOP_RUNTIME_JUDGES")
+    if raw_j is not None:
+        items = [s.strip() for s in raw_j.split(",") if s.strip()]
+        if items:
+            data.setdefault("runtime", {})["judges"] = [
+                {"provider": s, "weight": 1.0} for s in items
+            ]
+        else:
+            # explicit empty -> disable multi-judge
+            data.setdefault("runtime", {})["judges"] = None
+
+    # v0.3 multi-strategy: comma-separated provider list (parallel to judges).
+    raw_s = os.environ.get("AGENT_LOOP_RUNTIME_STRATEGIES")
+    if raw_s is not None:
+        items = [s.strip() for s in raw_s.split(",") if s.strip()]
+        if items:
+            data.setdefault("runtime", {})["strategies"] = [
+                {"provider": s, "weight": 1.0} for s in items
+            ]
+        else:
+            data.setdefault("runtime", {})["strategies"] = None
     return data
 
 

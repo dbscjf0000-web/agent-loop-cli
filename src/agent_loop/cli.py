@@ -32,6 +32,8 @@ from agent_loop import __version__
 from agent_loop.config import (
     DEFAULT_USER_CONFIG,
     Config,
+    JudgeSpec,
+    StrategySpec,
     init_default_config,
     load_config,
     _DEFAULT_TOML,
@@ -84,6 +86,28 @@ def _root(
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
+def _override_judges(cfg: Config, judges: list[str] | None) -> Config:
+    """Replace cfg.runtime.judges with explicit `--judge` flags (each weight=1.0).
+
+    Empty list means user did not pass any flags -> leave cfg unchanged.
+    """
+    if not judges:
+        return cfg
+    cfg.runtime.judges = [JudgeSpec(provider=p, weight=1.0) for p in judges]
+    return cfg
+
+
+def _override_strategies(cfg: Config, strategies: list[str] | None) -> Config:
+    """Replace cfg.runtime.strategies with explicit `--strategy` flags (each weight=1.0).
+
+    Empty list means user did not pass any flags -> leave cfg unchanged.
+    """
+    if not strategies:
+        return cfg
+    cfg.runtime.strategies = [StrategySpec(provider=p, weight=1.0) for p in strategies]
+    return cfg
+
+
 @app.command("run")
 def cmd_run(
     task: str = typer.Argument(..., help="Task description (free-form prose)."),
@@ -93,12 +117,26 @@ def cmd_run(
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config TOML."),
     task_id: Optional[str] = typer.Option(None, "--task-id", help="Reuse this id (else random)."),
     root: Path = typer.Option(Path("./.agent_loop"), "--root", help="State root directory."),
+    judge: list[str] = typer.Option(
+        [],
+        "--judge",
+        help="(v0.3) Multi-judge provider id, repeatable. Cross-vendor recommended. "
+        "Example: --judge claude/default --judge gemini/gemini-2.5-flash",
+    ),
+    strategy: list[str] = typer.Option(
+        [],
+        "--strategy",
+        help="(v0.3) Multi-strategy plan provider id, repeatable. Cross-vendor recommended. "
+        "Example: --strategy claude/default --strategy cursor/auto",
+    ),
 ) -> None:
     """Run a fresh task through the loop."""
     if mode not in ("auto", "supervised"):
         raise typer.BadParameter("mode must be 'auto' or 'supervised'")
 
     cfg = load_config(config_path)
+    cfg = _override_judges(cfg, judge)
+    cfg = _override_strategies(cfg, strategy)
     tid = task_id or new_task_id()
     td = TaskDir(root=root, task_id=tid)
     td.init()
@@ -106,6 +144,14 @@ def cmd_run(
     console.print(f"[bold green][OK][/bold green] task_id = [magenta]{tid}[/magenta]")
     console.print(f"     root    = {td.path}")
     console.print(f"     cycles  = {cycles}, mode = {mode}, max_redo = {max_redo}")
+    if cfg.runtime.judges:
+        provs = ", ".join(j.provider for j in cfg.runtime.judges)
+        console.print(f"     judges  = [yellow]{provs}[/yellow] ({len(cfg.runtime.judges)})")
+    if cfg.runtime.strategies:
+        sprovs = ", ".join(s.provider for s in cfg.runtime.strategies)
+        console.print(
+            f"     strats  = [yellow]{sprovs}[/yellow] ({len(cfg.runtime.strategies)})"
+        )
 
     orch = Orchestrator(td, cfg, console=console)
     result = orch.run(task=task, max_cycles=cycles, mode=mode, max_redo=max_redo)
@@ -181,6 +227,16 @@ def cmd_bench(
     ),
     root: Path = typer.Option(Path("./.agent_loop"), "--root"),
     config_path: Optional[Path] = typer.Option(None, "--config"),
+    judge: list[str] = typer.Option(
+        [],
+        "--judge",
+        help="(v0.3) Multi-judge provider id, repeatable. Same semantics as `agent-loop run --judge`.",
+    ),
+    strategy: list[str] = typer.Option(
+        [],
+        "--strategy",
+        help="(v0.3) Multi-strategy provider id, repeatable. Same semantics as `agent-loop run --strategy`.",
+    ),
 ) -> None:
     """Run a benchmark task from benchmarks/."""
     bench_dir = _find_benchmarks_dir()
@@ -196,6 +252,8 @@ def cmd_bench(
         names = sorted(p.stem for p in bench_dir.glob("*.yaml") if p.stem != "README")
 
     cfg = load_config(config_path)
+    cfg = _override_judges(cfg, judge)
+    cfg = _override_strategies(cfg, strategy)
     for n in names:
         path = bench_dir / f"{n}.yaml"
         if not path.exists():

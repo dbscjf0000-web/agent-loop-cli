@@ -223,6 +223,23 @@ def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
 
 
 def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """Generate plan.md.
+
+    Two modes:
+      - **single** (default): one LLM plan call as configured by ``config.models.plan``.
+      - **multi-strategy** (v0.3): when ``config.runtime.strategies`` is non-empty,
+        ``_run_plan_multi`` fans out to N providers in parallel and a Selector
+        picks one winner. The winner's text is written to ``plan.md`` so all
+        downstream phases (Implement / Verify / Judge) are unaware of the
+        fan-out.
+    """
+    if config.runtime.strategies:
+        return _run_plan_multi(task_dir, config)
+    return _run_plan_single(task_dir, config)
+
+
+def _run_plan_single(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """v0.1 / v0.2 body: single LLM plan call. Preserved verbatim for backward compat."""
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
@@ -246,6 +263,75 @@ def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
         }
     )
     return resp
+
+
+def _run_plan_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """v0.3 multi-strategy: N strategies fan out, selector picks winner.
+
+    Writes:
+      - artifacts/proposals.json     -- full audit of every PlanProposal
+      - artifacts/plan_selector.json -- winner index, scores, selector method
+      - artifacts/plan.md            -- winner.text (downstream-compatible)
+
+    On ``AllStrategiesFailed`` the exception propagates so the orchestrator
+    treats it as an explicit cycle error (rather than silently falling back
+    to single, which would mask a complete cross-vendor outage).
+    """
+    # Late import: keeps workers.py importable even if strategy_engine errors.
+    from agent_loop.strategy_engine import (
+        AllStrategiesFailed,
+        StrategyEngine,
+        proposal_to_dict,
+        selection_to_dict,
+    )
+
+    task = task_dir.task_md_path().read_text(encoding="utf-8")
+    memory = _memory_text(task_dir)
+    findings = _read_or(task_dir, "findings.md", "(no findings)")
+    prompt = _load_prompt("plan").format(
+        task=task, memory=memory, findings=findings
+    )
+
+    engine = StrategyEngine(task_dir, config)
+    started = time.time()
+
+    selection = engine.fanout(config.runtime.strategies, prompt)
+
+    # Write audit artifacts.
+    proposals_payload = {
+        "proposals": [proposal_to_dict(p) for p in selection.proposals],
+    }
+    task_dir.write_artifact("proposals.json", proposals_payload)
+    task_dir.write_artifact("plan_selector.json", selection_to_dict(selection))
+
+    # Winner text becomes the canonical plan.md so downstream phases don't change.
+    task_dir.write_artifact("plan.md", selection.winner.text)
+
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "plan",
+            "summary": _summarize(selection.winner.text),
+            "model": f"(strategy: {selection.winner.provider})",
+            "n_proposals": len(selection.proposals),
+            "selected_provider": selection.winner.provider,
+            "selector_method": selection.selector_method,
+        }
+    )
+
+    # Aggregate ModelResponse: cost = sum, latency = max (parallel critical path)
+    total_cost = sum(p.cost_usd for p in selection.proposals if p.error is None)
+    latencies = [p.latency_s for p in selection.proposals if p.error is None] or [0.0]
+    tokens_in = sum(p.tokens_in for p in selection.proposals if p.error is None)
+    tokens_out = sum(p.tokens_out for p in selection.proposals if p.error is None)
+    return ModelResponse(
+        text=selection.winner.text,
+        prompt_tokens=tokens_in,
+        completion_tokens=tokens_out,
+        cost_usd=round(total_cost, 6),
+        latency_s=round(max(latencies), 4) or round(time.time() - started, 4),
+        model=f"(strategy: {selection.winner.provider} of {len(selection.proposals)})",
+    )
 
 
 def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
@@ -400,9 +486,22 @@ def _run_verify_llm_legacy(task_dir: TaskDir, config: Config) -> ModelResponse:
 def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
     """Compare current solution.json to best_solution.json and decide next action.
 
-    Special case: if no best_solution exists yet (first cycle), short-circuit
-    to better=true without spending an LLM call.
+    Two modes:
+      - **single** (default): one LLM judge as configured by ``config.models.judge``.
+        Includes the first-cycle short-circuit (no LLM call when there is no
+        ``best_solution.json`` yet).
+      - **multi-judge** (v0.3): when ``config.runtime.judges`` is non-empty,
+        ``_run_judge_multi`` fans out to N providers in parallel and writes a
+        ``consensus`` payload alongside the canonical schema. The first-cycle
+        short-circuit still applies (no fan-out cost on cycle 1).
     """
+    if config.runtime.judges:
+        return _run_judge_multi(task_dir, config)
+    return _run_judge_single(task_dir, config)
+
+
+def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """v0.1/v0.2 body: one LLM judge call. Preserved verbatim for backward compat."""
     if not task_dir.has_artifact("best_solution.json"):
         # First cycle: nothing to compare against.
         sol = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
@@ -489,6 +588,134 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
         }
     )
     return resp
+
+
+def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
+    """v0.3 multi-judge: N providers fan out, weighted-majority aggregation.
+
+    First-cycle short-circuit defers to ``_run_judge_single`` (no fan-out cost
+    when there is no prior best to compare against). All-judges-fail also
+    falls back to single, with the resulting ``judge_result.json`` annotated
+    with ``consensus.fallback = True``.
+    """
+    if not task_dir.has_artifact("best_solution.json"):
+        return _run_judge_single(task_dir, config)
+
+    # Late import: keeps workers.py importable even if judge_engine has issues.
+    from agent_loop.judge_engine import (
+        AllJudgesFailed,
+        JudgeEngine,
+        consensus_to_dict,
+    )
+
+    task = task_dir.task_md_path().read_text(encoding="utf-8")
+    memory = _memory_text(task_dir)
+    sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
+    best_obj = task_dir.read_artifact("best_solution.json")
+    sol_str = json.dumps(sol_obj, indent=2, ensure_ascii=False)
+    best_str = json.dumps(best_obj, indent=2, ensure_ascii=False)
+
+    max_redo = config.runtime.max_redo
+    redo_count = _current_redo_count(task_dir)
+
+    prompt = _load_prompt("judge").format(
+        task=task,
+        solution=sol_str,
+        best_solution=best_str,
+        memory=memory,
+        redo_count=redo_count,
+        max_redo=max_redo,
+    )
+
+    engine = JudgeEngine(task_dir, config)
+    started = time.time()
+    try:
+        result = engine.consensus(config.runtime.judges, prompt)
+    except AllJudgesFailed as e:
+        # Fallback path: every judge errored. Run the single-judge body and
+        # annotate the result with consensus.fallback so observers know.
+        resp = _run_judge_single(task_dir, config)
+        existing = task_dir.read_artifact("judge_result.json")
+        if isinstance(existing, dict):
+            existing["consensus"] = {
+                "n_judges": len(e.individuals),
+                "votes_action": {},
+                "votes_better": {},
+                "fallback": True,
+                "individual": [
+                    {
+                        "provider": i.provider,
+                        "weight": i.weight,
+                        "better": i.better,
+                        "action": i.action,
+                        "weighted_score": i.weighted_score,
+                        "hint": i.hint,
+                        "reason": i.reason,
+                        "error": i.error,
+                        "latency_s": i.latency_s,
+                    }
+                    for i in e.individuals
+                ],
+            }
+            task_dir.write_artifact("judge_result.json", existing)
+        return resp
+
+    # Compose the canonical judge_result.json schema with consensus payload.
+    this_score = result.scores.get("weighted")
+    sol_score = (
+        sol_obj.get("weighted_score", sol_obj.get("score"))
+        if isinstance(sol_obj, dict)
+        else None
+    )
+    best_score = (
+        best_obj.get("weighted_score", best_obj.get("score"))
+        if isinstance(best_obj, dict)
+        else None
+    )
+    if this_score is None:
+        this_score = sol_score
+    delta: float | None = None
+    if isinstance(this_score, (int, float)) and isinstance(best_score, (int, float)):
+        delta = float(this_score) - float(best_score)
+
+    payload: dict[str, Any] = {
+        "better": result.better,
+        "action": result.action,
+        "reason": result.reason,
+        "hint": result.hint,
+        "scores": {
+            "weighted": this_score,
+            "this_cycle": this_score,
+            "best": best_score,
+            "delta": delta,
+        },
+        "consensus": consensus_to_dict(result),
+    }
+    task_dir.write_artifact("judge_result.json", payload)
+
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "judge",
+            "summary": _summarize(result.reason),
+            "hint": result.hint,
+            "score": float(this_score or 0.0),
+            "model": f"(consensus: {result.n_judges} judges)",
+            "n_judges": result.n_judges,
+        }
+    )
+
+    # Aggregate ModelResponse: cost = sum, latency = max (parallel critical path)
+    costs = sum(0.0 for _ in result.individual)  # CLI providers report 0.0; safe default
+    latencies = [j.latency_s for j in result.individual if j.error is None] or [0.0]
+    return ModelResponse(
+        text=json.dumps(payload),
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost_usd=costs,
+        latency_s=round(max(latencies), 4) or round(time.time() - started, 4),
+        model=f"(consensus: {result.n_judges} judges)",
+    )
 
 
 def _current_redo_count(task_dir: TaskDir) -> int:

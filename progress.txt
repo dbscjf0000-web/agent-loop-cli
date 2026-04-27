@@ -1,5 +1,6 @@
 ## Codebase Patterns (최상단 고정)
 - v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
+- 진짜 cross-vendor verify 증명 (2026-04-27): free-form `agent-loop run` (rubric 없음) + cursor→gemini-2.5-flash 조합으로 verify가 실제 LLM 호출됨 (15.25s, 한국어 evidence). 단 judge는 first cycle 에서 자동 skip ("no prior best") — 다중 vendor judge 증명은 score<1.0 task 필요. claude/default 는 free-form verify 에서 600s timeout 재현됨.
 - 이 프로젝트는 standalone CLI (Python). Claude Code 의존성 없음.
 - 모델 추상화: litellm + 3개 CLI provider (cursor / claude / gemini, 모두 subprocess).
   `cursor/<m>` / `claude/<m>` / `gemini/<m>` 모델 id는 `_cli_provider()` 헬퍼가
@@ -49,7 +50,136 @@
   rule 도 DSL 형식으로 변환됨.
 - `solution.json` 새 스키마: `{"weighted_score", "summary", "axes": [...]}`. evidence 는 summary 와 동일
   (legacy 호환). v0.1 `{"score": ...}` 도 judge first-cycle 에서 `weighted_score | score` 폴백 처리.
+- v0.3 Multi-judge: `src/agent_loop/judge_engine.py` 의 `JudgeEngine.consensus(judges, prompt)` 진입점.
+  ThreadPoolExecutor 로 N provider 병렬 호출 + weighted majority 합의. `Runtime.judges` (list[JudgeSpec])
+  가 비어있지 않으면 `workers.run_judge` 가 `_run_judge_multi` 분기 (first-cycle short-circuit 보존).
+  `judge_result.json` 에 `consensus` 키 추가 (single 모드는 변경 X — backward compat). 합의 알고리즘:
+  action 동률시 'stop' 우선 → 알파벳 첫번째, better 동률시 False (보수). all-fail 시 single fallback +
+  `consensus.fallback=True`. CLI: `--judge` 반복 가능 플래그, ENV `AGENT_LOOP_RUNTIME_JUDGES` 콤마구분.
+- v0.3 Multi-strategy: `src/agent_loop/strategy_engine.py` 의 `StrategyEngine.fanout(strategies, prompt)`
+  진입점. ThreadPoolExecutor 로 N provider 병렬 plan 호출 + Selector(휴리스틱+LLM) winner 1개. 휴리스틱:
+  length/fenced/steps/headers 가중합. LLM rubric 은 `cfg.models.plan` 1회 호출 (실패시 structural fallback,
+  selector_method="fallback"). `Runtime.strategies` (list[StrategySpec]) 가 비어있지 않으면
+  `workers.run_plan` 이 `_run_plan_multi` 분기. winner.text 그대로 `plan.md` 에 저장 (downstream 호환),
+  전체 audit 은 `proposals.json`, selector 결과는 `plan_selector.json`. 단일 proposal 시 selector 호출 X.
+  All-fail → `AllStrategiesFailed` raise (single fallback 안 함, 명시적 에러). CLI: `--strategy` 반복가능,
+  ENV `AGENT_LOOP_RUNTIME_STRATEGIES`. JudgeEngine 의 `_call_one` 패턴(Config 복제 + model 덮어쓰기)을
+  strategy_engine 안에 복제 — 두 엔진 간 import X (engine 결합 회피).
 
+---
+
+## [2026-04-27 17:35] - 진짜 cross-vendor LLM 검증 (free-form + multi-cycle)
+- 검증 1 (cursor + gemini-2.5-flash, free-form `gcd`): cycles_run=1, weighted_score=1.000,
+  final_status=stop. **Verify가 진짜 LLM 호출됨** — gemini-2.5-flash 15.25s, 873/129 tokens,
+  한국어 evidence가 solution.json 에 기록됨 (rubric 우회 caveat 해소 ✓).
+  cursor도 research/plan/implement 모두 LLM 호출됨 (각 22.7/22.2/15.7s).
+- 검증 2 (cursor + claude verify + gemini judge, free-form `is_palindrome`): claude verify
+  600s timeout 발생 (`claude --print` 자체 agentic). 코드 수정 없이 사실 그대로 기록.
+  cursor 3 phase 까지는 정상 (~52s 합).
+- 해소된 caveat: Verify의 LLM 경로가 cross-vendor (cursor→gemini)로 실제 작동함을 증명.
+- 새 limitation: judge가 첫 cycle에서 자동으로 stop=True+skip ("first cycle is automatically
+  the best") — cycle 2 강제는 weighted_score<1.0 task나 코드 수정 (judge always-LLM) 필요.
+  claude/default 의 verify 600s timeout 은 transient 가 아니라 재현됨 — 사용자 가이드 명시.
+- 변경 파일: README.md (free-form follow-up 섹션 추가), progress.txt
+- 상태: 완료
+- 다음 할 일:
+  - (워커) judge first-cycle skip 옵션화 (configurable: "always_call_llm" or "skip_first_cycle"),
+    free-form task 에서 cycle 2 자동 강제 모드 검토
+  - (워커) `cli_timeout` 환경변수 또는 config 항목으로 노출 — claude verify 700~900s 허용
+- 학습:
+  - 패턴: free-form task (rubric 없음) 면 verify가 무조건 LLM 호출 → cross-vendor 검증의 핵심
+  - 주의사항: `agent-loop run` 의 first cycle 에서 verify_score=1.0 이면 judge LLM 미호출,
+    다중 vendor judge 검증 하려면 task 를 더 어렵게 하거나 score < 1.0 유도 필요
+- 산출물: /tmp/al_xv1/.agent_loop/13fb98/, /tmp/al_xv2/.agent_loop/db7f56/
+
+---
+
+## [2026-04-27 16:39] - v0.3 Multi-judge consensus (워커 B)
+- 구현:
+  - `docs/plan-v0.3.md` 신규 (multi-judge + multi-strategy 둘 다 다루는 v0.3 통합 plan, 14 절)
+  - `src/agent_loop/judge_engine.py` 신규 (~330 줄): `JudgeEngine.consensus`,
+    `IndividualJudgement` / `ConsensusResult` dataclass, `AllJudgesFailed` exception,
+    `consensus_to_dict` / `individual_to_dict`. ThreadPoolExecutor fan-out + 결정적 합의.
+  - `src/agent_loop/config.py` 확장: `JudgeSpec` (provider+weight, weight>0 검증),
+    `Runtime.judges: list[JudgeSpec] | None`, `_normalize_judges` field validator
+    (str list → JudgeSpec list, 빈 리스트 → None), `AGENT_LOOP_RUNTIME_JUDGES` ENV override.
+  - `src/agent_loop/workers.py` 수정: `run_judge` → `_run_judge_single` / `_run_judge_multi`
+    분기. multi 는 first-cycle 시 single 위임 (fan-out 비용 0), all-fail 시 single fallback +
+    `consensus.fallback=True` annotation. 기존 first-cycle short-circuit 본체 그대로 보존.
+  - `src/agent_loop/orchestrator.py` 미세: judge phase 의 metric 행에 `n_judges`,
+    `votes_action`, `votes_better`, `consensus_fallback` 키 추가 (single 모드면 미부착).
+  - `src/agent_loop/cli.py`: `_override_judges` 헬퍼 + `run` / `bench` 에 `--judge` 반복가능
+    플래그. `config show` 는 `model_dump()` 가 자동으로 `judges` 노출.
+  - `tests/test_judge_engine.py` 신규 (13 tests): happy path 3-judge, 2:1 majority,
+    동률 stop 우선, 동률 알파벳, weight 적용, partial failure, all-fail, 가중평균,
+    score None mix, better tie False, unparseable JSON, consensus_to_dict shape, empty list.
+  - `tests/test_workers_multijudge.py` 신규 (8 tests): single 모드 보존, multi 첫 cycle
+    short-circuit, multi 정상 cycle consensus 작성, all-fail fallback annotation, config
+    list[str] 정규화, 빈 리스트 → None, 음수 weight 거부, ENV override.
+  - `README.md`: status v0.3-dev 갱신 + "Multi-judge consensus (v0.3)" 섹션 (~80줄,
+    config 3가지 표기 + 합의 규칙 표 + output schema 예시 + failure handling).
+  - `docs/architecture.md`: 헤더 v0.3-dev, 모듈 박스에 Judge Engine 추가, 모듈 책임 표에
+    judge_engine 행, "Where v0.3+ components plug in" 갱신 (Judge DONE, Strategy 진행중).
+  - `progress.txt`: Codebase Patterns 에 multi-judge 진입점 / multi-strategy hook 2 줄 추가.
+- 변경 파일:
+  - 신규: `docs/plan-v0.3.md`, `src/agent_loop/judge_engine.py`,
+    `tests/test_judge_engine.py`, `tests/test_workers_multijudge.py`
+  - 수정: `src/agent_loop/config.py`, `src/agent_loop/workers.py`,
+    `src/agent_loop/orchestrator.py`, `src/agent_loop/cli.py`,
+    `README.md`, `docs/architecture.md`, `progress.txt`
+- 상태: 완료 (mock 검증, 라이브 X)
+- 검증:
+  - `python3 -m pytest tests/ -q` → **98 passed in 4.57s** (이전 77 + 신규 21)
+  - regression 0. v0.2.1 모든 tests 그대로 통과.
+  - mock 합의 시나리오 직접 시연:
+    - 3-judge all stop / weighted_avg = (0.9+0.85+0.8)/3 = 0.85
+    - 2:1 majority → action=stop, votes_action={"stop":2,"redo_P":1}
+    - 1:1 tie + stop 포함 → stop (보수)
+    - 1:1 tie + stop 없음 → redo_P (알파벳 우선)
+    - weight 2:1:1 → tie → stop
+    - 1 partial fail → 나머지 2로 합의 + individual[1].error 채워짐
+    - 3 all fail → AllJudgesFailed (workers 가 single fallback)
+- 다음 할 일 (워커 C):
+  1. `docs/plan-v0.3.md` §5 (multi-judge 본구현, 참조용) + §6 (multi-strategy 설계 명세) 정독.
+  2. `src/agent_loop/strategy_engine.py` 신규 — `StrategySpec` / `PlanProposal` /
+     `SelectorResult` / `StrategyEngine.fan_out + select`. JudgeEngine 의 `_call_one`
+     패턴(Config 복제 후 cfg.models.plan override) 재사용.
+  3. `Runtime.strategies: list[StrategySpec] | None` 추가, `_normalize_strategies` validator,
+     `AGENT_LOOP_RUNTIME_STRATEGIES` ENV.
+  4. `workers.run_plan` 분기: judges 와 동일 패턴으로 `_run_plan_single` / `_run_plan_multi`.
+     multi 는 fan-out → Selector → winner 의 plan_text 를 plan.md 에 그대로 저장. proposals
+     은 `proposals.json`, selector 결과는 `plan_selector.json` 에 audit.
+  5. CLI `--strategy` flag (run/bench), config show 자동 노출.
+  6. 단위 테스트: `test_strategy_engine.py` (8+) + `test_workers_multistrategy.py` (3+).
+  7. README "Multi-strategy plans (v0.3)" 섹션 + architecture.md Strategy Engine 박스.
+  8. progress.txt 갱신.
+  ⚠️ 워커 C 가 알아둘 핵심:
+  - `judge_engine.py` 직접 import 하지 말 것 (engine 간 결합 회피). 같은 패턴을
+    strategy_engine 안에 복제. 공통이 보이면 v0.3.1 에서 `_fanout.py` 추출 검토 (지금은 X).
+  - prompts/plan.md 변경 X. 동일 prompt 를 N strategies 에 그대로.
+  - `_run_plan_multi` 가 반환하는 ModelResponse: cost = sum(individual), latency = max
+    (병렬 critical path).
+  - Selector v0.3.0: 휴리스틱 (길이/fence/step/header) + 단일 LLM rubric (cfg.models.plan
+    1회) 가중합. LLM 실패 → structural fallback. proposal 1 개 → selector 호출 X.
+  - workers.run_plan 시그니처 (`(TaskDir, Config) -> ModelResponse`) 유지.
+- 학습:
+  - 패턴:
+    - `Config.model_copy(deep=True)` 가 ThreadPool 안전한 per-thread override 의 정석.
+      `cfg.models.judge = spec.provider` 한 줄로 provider override 끝.
+    - `concurrent.futures.ThreadPoolExecutor` 가 stdlib + CLI subprocess IO bound 에 충분.
+      asyncio 끌어들일 이유 X.
+    - 결정적 tie-break (stop 우선 / 알파벳 정렬 / better False) 가 테스트 안정성에 결정적.
+      randomness 한 톨 들어가면 flaky.
+    - `as_completed` 로 받되 dict[index] 로 입력 순서 보존하는 게 individual list 의
+      예측가능성을 줌 (테스트에서 `individual[0].error is None` 같은 단언이 가능).
+  - 주의사항:
+    - pydantic v2 의 `field_validator(mode="before")` 가 raw input 정규화에 적합.
+      mode 생략하면 type 검증 후 호출되어 list[str] → list[JudgeSpec] 변환 못 함.
+    - JudgeEngine 에서 `_extract_json` / `_load_judge_prompt` 를 workers.py 와 분리해
+      복제했음 — 두 모듈이 서로 import 하면 cycle 위험. 공유는 v0.4 검토.
+    - `ThreadPoolExecutor` `max_workers=len(judges)` — 1 개일 때 0 되지 않게 max(1, ...).
+    - `model_dump()` 가 pydantic v2 에서 default 로 `JudgeSpec` 도 dict 로 풀어주므로
+      `config show` 자동으로 잘 나옴 (별도 직렬화 코드 X).
 ---
 
 ## [2026-04-27 12:19] - 프로젝트 초기 셋업
@@ -674,4 +804,102 @@
       이름이 달라서 dispatcher 분기 시 명확히 구분.
     - 이번 e2e 는 1 cycle 자동 stop 으로 끝나 multi-cycle 동작은 검증 안 됨.
       free-form `run` 명령으로 강제 다중 cycle 검증은 v0.3 stress test 후보.
+---
+
+## [2026-04-27 17:25] - v0.3 Multi-strategy plan fan-out (워커 C)
+- 구현:
+  - `src/agent_loop/strategy_engine.py` 신규 (~370 줄): `StrategyEngine.fanout`,
+    `PlanProposal` / `SelectionResult` dataclass, `AllStrategiesFailed` exception,
+    `_score_heuristic` (length/fenced/steps/headers 가중합), `_select` (heuristic+LLM
+    rubric 0.6/0.4 가중합, LLM 실패 시 structural fallback), `_call_one`
+    (Config 복제 + cfg.models.plan 덮어쓰기), `proposal_to_dict`/`selection_to_dict`.
+    JudgeEngine 의 `_call_one` 패턴 복제 (직접 import 회피).
+  - `src/agent_loop/config.py` 확장: `StrategySpec` (provider+weight, weight>0 검증),
+    `Runtime.strategies: list[StrategySpec] | None`, `_normalize_strategies` field
+    validator (str list → StrategySpec list, 빈 리스트 → None),
+    `AGENT_LOOP_RUNTIME_STRATEGIES` ENV override.
+  - `src/agent_loop/workers.py` 수정: `run_plan` → `_run_plan_single` /
+    `_run_plan_multi` 분기. multi 는 `StrategyEngine.fanout` 호출 → winner.text
+    를 plan.md 에 그대로 저장 (downstream 호환), `proposals.json` (전체 audit)
+    + `plan_selector.json` (winner index/scores/method) 작성. ModelResponse 합성:
+    cost=sum(valid), latency=max(valid), tokens=sum(valid). all-fail 은
+    `AllStrategiesFailed` raise (single fallback 안 함 — 명시적 에러로 orchestrator
+    가 partial cycle 처리).
+  - `src/agent_loop/orchestrator.py` 미세: plan phase 의 metric 행에
+    `n_strategies`, `selector_method`, `winner_index`, `winner_provider`,
+    `selector_fallback` 키 추가 (single 모드면 `plan_selector.json` 부재라
+    아무 키도 미부착).
+  - `src/agent_loop/cli.py`: `_override_strategies` 헬퍼 + `run` / `bench` 에
+    `--strategy` 반복가능 플래그. `config show` 는 `model_dump()` 가 자동으로
+    `strategies` 노출. `StrategySpec` import.
+  - `tests/test_strategy_engine.py` 신규 (11 tests, mock):
+    happy path 3 strategies, partial failure, all-fail, selector LLM 실패 fallback,
+    heuristic 점수 components, 단일 proposal short-circuit, weight tie-break,
+    equal weight tie → lower index, empty list 거부, selection_to_dict shape,
+    selector malformed JSON fallback.
+  - `tests/test_workers_multistrategy.py` 신규 (8 tests, mock):
+    single mode 보존, multi 정상 cycle 모든 artifact 작성, winner.text == plan.md
+    byte-identical, config list[str] 정규화, 빈 리스트 → None, 음수 weight 거부,
+    ENV override, AllStrategiesFailed propagate.
+  - `README.md`: status v0.3-dev 갱신 (117 tests = 77 + 21 + 19) + "Multi-strategy
+    plan (v0.3)" 섹션 (~110 줄, config 3 표기 + selector 알고리즘 + output schema +
+    failure handling + caveats), env vars 표에 `AGENT_LOOP_RUNTIME_STRATEGIES` 추가.
+  - `docs/architecture.md`: 헤더 갱신, layered view 박스에 Strategy Engine 추가
+    (10 modules, 6 leaves), 모듈 책임 표에 strategy_engine 행, "Where v0.3+" 의
+    Strategy 항목 DONE 으로, Non-goals 에서 Multi-strategy 항목 제거.
+  - `progress.txt`: Codebase Patterns 의 multi-strategy 항목 1줄 → 본구현 명세로
+    교체 (StrategyEngine 진입점, plan.md 호환, all-fail raise 정책).
+- 변경 파일:
+  - 신규: `src/agent_loop/strategy_engine.py`, `tests/test_strategy_engine.py`,
+    `tests/test_workers_multistrategy.py`
+  - 수정: `src/agent_loop/config.py`, `src/agent_loop/workers.py`,
+    `src/agent_loop/orchestrator.py`, `src/agent_loop/cli.py`,
+    `README.md`, `docs/architecture.md`, `progress.txt`
+- 상태: 완료 (mock 검증, 라이브 X)
+- 검증:
+  - `python3 -m pytest tests/ -q` → **117 passed in 4.78s** (이전 98 + 신규 19)
+  - regression 0. v0.3-multijudge 모든 tests 그대로 통과.
+  - mock 시나리오 직접 시연:
+    - 3-strategy all OK + selector heuristic+llm → winner_index=0 (claude),
+      scores=[{structural, llm=0.95, final=0.86}, ...], 4 calls (3 plan + 1 rubric)
+    - 1 strategy fail → 나머지 2로 selection, proposals[1].error 채워짐, scores[1].final=0
+    - 3 all fail → AllStrategiesFailed (workers 가 raise propagate)
+    - selector LLM RuntimeError → selector_method="fallback", structural-only로 winner
+    - 단일 proposal → selector_method="single", LLM 호출 0
+    - weight 1.0 vs 2.0 동률 score → higher weight (B index=1) 승리
+    - equal weight 동률 → lower index (A index=0) 승리
+    - selector malformed JSON → fallback (structural-only)
+  - winner.text == plan.md (byte-identical, downstream 호환 검증)
+- 다음 할 일 (v0.3.0 release):
+  1. live 검증 — `agent-loop run "..." --strategy claude/default --strategy gemini/gemini-2.5-flash --strategy cursor/auto`
+     로 실제 cross-vendor 3-strategy 시나리오 측정. 단일 cursor/auto 대비 plan 품질 개선 측정.
+  2. `agent-loop bench n_queens --strategy claude/default --strategy gemini/gemini-2.5-flash`
+     로 multi-strategy + multi-judge 동시 활성화 e2e (selector latency 가 critical path 에 미치는 영향 측정).
+  3. `--strategy` 와 `--judge` 둘 다 cross-vendor 로 set 한 시나리오 비용/latency budget 측정.
+  4. v0.3.1 후보:
+     - `_fanout.py` 공통 모듈 추출 (StrategyEngine + JudgeEngine 공통 ThreadPool fan-out 패턴).
+     - Selector 자체를 multi-judge 로 교체 (workers C 의 LLM rubric 1회 → judges N 회로 generalize).
+     - Strategy 별 prompt 차별화 (현재는 모두 동일 prompt — provider 만 다름).
+- 학습:
+  - 패턴:
+    - JudgeEngine 의 `_call_one` (Config 복제 + model 덮어쓰기) 패턴이 그대로
+      재사용 가능. 두 엔진은 prompt only / output 형식 / 집계 알고리즘이 다를 뿐
+      fan-out 자체는 동일. 공통 추출은 third use 가 나오면 (v0.3.1 후보).
+    - `selector_method` 4종 (`single` / `heuristic_only` / `heuristic+llm` / `fallback`)
+      이 metric 에 그대로 노출 — 운영자가 selector LLM 안정성을 모니터링하기 좋음.
+    - winner.text 를 plan.md 에 그대로 저장 = downstream phase (Implement / Verify /
+      Judge) 가 multi-strategy 모드 인지 자체를 모름 (backward compat 의 정석).
+    - 결정적 tie-break (higher weight → lower index) 로 테스트 안정성 확보.
+  - 주의사항:
+    - `AllStrategiesFailed` 는 silent fallback 이 아니라 raise — 모든 vendor 동시
+      실패는 인프라 문제이므로 cycle 을 멈추고 사용자에게 보여주는 게 안전 (multi-judge
+      는 single fallback 했지만, multi-strategy 는 plan 이 없으면 implement 가
+      입력을 잃으니 다른 정책).
+    - `_score_heuristic` 의 structural=0.0 (빈 텍스트) 이 final=0 으로 가서 실패한
+      proposal 이 winner 후보에서 자연스레 배제됨 — 그래도 `valid_indices` 로 명시적
+      필터링해서 안전하게.
+    - LLM rubric 호출이 `cfg.models.plan` 을 그대로 쓰는데, 이건 `_call_one` 에서
+      cfg 를 복제하기 때문에 selector 호출 시 원본 cfg 는 손상되지 않음 (검증 됨).
+    - `concurrent.futures.as_completed` 결과를 `dict[idx]` 로 저장 → 입력 순서 보존
+      → 테스트의 `proposals[1].error` 같은 단언이 안정.
 ---

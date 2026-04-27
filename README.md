@@ -7,13 +7,23 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
-**v0.2.1** — three CLI providers (`cursor-agent`, Claude Code `claude`, Google `gemini`) plus
-litellm in one model dispatch table, 77 unit tests passing, and a cross-vendor live
-`bench binary_search` run on KISTI Neuron with the v0.2 Verify Engine and Judge short-circuit
-(weighted_score=1.000, 1 cycle stop, total ~77 s wall clock). Earlier milestones:
+**v0.3-dev** — multi-judge consensus engine (worker-B) and multi-strategy plan
+fan-out (worker-C) both landed. `JudgeEngine` runs N parallel judges with
+weighted-majority aggregation; `StrategyEngine` runs N parallel plans through
+a heuristic+LLM Selector and writes the winner to `plan.md`. CLI surfaces both
+via `--judge` / `--strategy` (each repeatable) plus `AGENT_LOOP_RUNTIME_JUDGES`
+/ `AGENT_LOOP_RUNTIME_STRATEGIES` env vars. 117 unit tests passing (77 from
+v0.2.1 + 21 multi-judge + 19 multi-strategy). Live cross-vendor validation
+queued for v0.3.0 release. Earlier milestones:
+
+- **v0.2.1** — three CLI providers (`cursor-agent`, Claude Code `claude`, Google `gemini`) plus
+  litellm in one model dispatch table, 77 unit tests passing, and a cross-vendor live
+  `bench binary_search` run on KISTI Neuron with the v0.2 Verify Engine and Judge short-circuit
+  (weighted_score=1.000, 1 cycle stop, total ~77 s wall clock).
 
 - **v0.2** — Context Engine (3-tier memory) + Verify Engine (rubric-driven multi-axis scoring)
   live-validated on `n_queens` (cursor/auto, weighted_score=1.000).
+
 - **v0.1.1** — `cursor-agent` provider integration, first live e2e (binary_search, score 0.973).
 - **v0.1.0** — feature-complete MVP, dry-run e2e for all four reference benchmarks.
 
@@ -238,6 +248,271 @@ free-form prompt) to actually drive claude through legacy LLM verify and gemini
 through the second-cycle judge. Note that `claude --print` is itself agentic
 and can take several minutes per call; bump `cli_timeout` if needed.
 
+#### Free-form follow-up (2026-04-27): proving the LLM path actually executes
+
+To remove the rubric-short-circuit caveat above, two free-form `agent-loop run`
+sessions were driven on KISTI Neuron with `--cycles 2`. Without a YAML rubric,
+the Verify Engine cannot ground-truth and must call the LLM verifier.
+
+**Session 1 — `cursor + gemini-2.5-flash` (verify & judge), task `gcd(a, b)`**
+(`task_id=13fb98`):
+
+| phase     | latency | model                    | LLM ran?               |
+|-----------|---------|--------------------------|------------------------|
+| research  |  22.75s | cursor/auto              | yes (293/265 tokens)   |
+| plan      |  22.20s | cursor/auto              | yes (539/308 tokens)   |
+| implement |  15.77s | cursor/auto              | yes (633/210 tokens)   |
+| verify    |  15.25s | gemini/gemini-2.5-flash  | **yes (873/129 tokens)**, Korean evidence in `solution.json` |
+| judge     |   0.00s | (skipped: first cycle)   | no — `"no prior best — first cycle is automatically the best"` |
+
+`weighted_score=1.000`, `cycles_run=1`, `final_status=stop`. So with `cursor` driving the
+generative phases and `gemini-2.5-flash` doing free-form Verify, the cross-vendor
+LLM path is *proven to execute* — what was previously the most fragile claim of v0.2.1
+(was Verify just rubric short-circuiting?) is resolved on the verify side.
+
+**Session 2 — `cursor + claude/default verify + gemini judge`, task `is_palindrome(s)`**
+(`task_id=db7f56`): research/plan/implement completed via cursor (52.1s combined),
+then `claude --print` was invoked for free-form Verify and timed out:
+
+```
+RuntimeError: claude CLI timed out after 600s (model=default,
+workspace=/tmp/al_xv2/.agent_loop/db7f56/workspace)
+```
+
+This reproduces the warning above: `claude --print` on a free-form Verify prompt
+behaves agentically and can exceed the default 600 s `cli_timeout`. Run wall clock
+was 656 s (cursor 52 s + claude 600 s timeout + cleanup). No code changes were
+attempted in this run; the timeout is recorded as-is so users picking
+`verify = "claude/default"` know to either (a) raise `cli_timeout`, (b) switch verify
+to `gemini-2.5-flash`, or (c) prefer rubric-anchored Verify when claude is the verifier.
+
+**Resolved caveat:** the v0.2.1 cross-vendor run never proved the LLM Verify path
+worked across vendors because the rubric short-circuited it. Session 1 closes that gap
+for the cursor->gemini direction with a real, multi-call free-form trace.
+
+**Remaining limitations:**
+
+1. **Judge skipped on cycle 1.** `judge_result.json` reports `"no prior best —
+   first cycle is automatically the best"` and writes `latency_s=0.0` with
+   `model="(skipped: first cycle)"`. So the cross-vendor *judge* leg is still
+   not proven for tasks that hit weighted_score=1.0 on cycle 1; you need a
+   harder task that fails verify on cycle 1 (or a multi-cycle policy that
+   forces the judge LLM regardless) to exercise it.
+2. **`claude/default` verify timeout** on free-form Verify is real, not a
+   transient — bump `cli_timeout` or pick a smaller verifier.
+
+## Multi-judge consensus (v0.3)
+
+The single LLM judge of v0.1/v0.2 can be replaced with **N parallel judges + weighted-majority
+consensus**. Cross-vendor is the point: same-vendor fan-out is no signal.
+
+```toml
+# agent-loop.toml — three judges, equal weight
+[[judges]]
+provider = "claude/default"
+weight = 1.0
+
+[[judges]]
+provider = "gemini/gemini-2.5-flash"
+weight = 1.0
+
+[[judges]]
+provider = "cursor/auto"
+weight = 1.0
+```
+
+Or the short form (all weight=1.0):
+
+```toml
+[runtime]
+judges = ["claude/default", "gemini/gemini-2.5-flash", "cursor/auto"]
+```
+
+Or per-run via the CLI (overrides config):
+
+```bash
+agent-loop run "..." \
+  --judge claude/default \
+  --judge gemini/gemini-2.5-flash \
+  --judge cursor/auto
+```
+
+Or via env var (comma-separated, weight=1.0 each):
+
+```bash
+export AGENT_LOOP_RUNTIME_JUDGES="claude/default,gemini/gemini-2.5-flash,cursor/auto"
+agent-loop bench n_queens --cycles 2
+```
+
+### How consensus is computed
+
+| Field | Rule | Tie-break |
+|---|---|---|
+| `action` | weighted majority on `stop` / `redo_R` / `redo_P` | `stop` preferred (conservative); else alphabetic first |
+| `better` | weighted true vs. false sum | `False` (conservative — don't promote unless clearly better) |
+| `scores.weighted` | weighted average across judges that reported a score | `None` if no judge gave one |
+| `hint` / `reason` | `\n---\n` concat (with `[provider]` tag on `reason`) | n/a |
+
+Each judge runs **in parallel** via `concurrent.futures.ThreadPoolExecutor` (CLI subprocess
+calls are IO-bound, so threads are fine — no new dependencies). Wall-clock latency is the
+**max** across judges, not the sum.
+
+### Output schema
+
+`artifacts/judge_result.json` (multi mode) gains a `consensus` block alongside the canonical
+fields. Single mode (no `runtime.judges`) is unchanged for backward compatibility.
+
+```jsonc
+{
+  "better": true,
+  "action": "stop",
+  "scores": {"weighted": 0.85, "this_cycle": 0.85, "best": 0.78, "delta": 0.07},
+  "hint": "...\n---\n...",
+  "reason": "[claude/default] ...\n---\n[gemini/...] ...",
+  "consensus": {
+    "n_judges": 3,
+    "votes_action": {"stop": 2.0, "redo_P": 1.0},
+    "votes_better": {"true": 2.0, "false": 1.0},
+    "fallback": false,
+    "individual": [
+      {"provider": "claude/default", "weight": 1.0, "better": true, "action": "stop",
+       "weighted_score": 0.88, "hint": "...", "reason": "...", "error": null,
+       "latency_s": 4.21},
+      // ...
+    ]
+  }
+}
+```
+
+### Failure handling
+
+- **One judge fails** (timeout / parse error): recorded as `individual[i].error`. Consensus
+  proceeds with the rest (partial consensus).
+- **All judges fail**: silent fallback to a single-judge call (`config.models.judge`). The
+  resulting `judge_result.json` is annotated `consensus.fallback = true` so observers can
+  see what happened.
+- **First cycle** (no `best_solution.json` yet): the multi-judge path defers to the single
+  short-circuit — no fan-out cost on cycle 1.
+
+### Caveats
+
+- Recommended N ≤ 3 to stay under inode / load pressure on shared clusters.
+- `gemini/gemini-2.5-flash` is the fastest judge in our setup (~8 s cold, ~3 s warm) and is
+  the default suggestion for one of the three slots.
+- The slowest judge sets the critical path. If `claude/default` warms up at 60 s, the
+  whole consensus waits.
+
+## Multi-strategy plan (v0.3)
+
+The single LLM plan call of v0.1/v0.2 can be replaced with **N parallel plan
+proposals + a Selector that picks the best one**. As with multi-judge, cross-vendor
+is the point — same-vendor fan-out gives no diversity signal.
+
+```toml
+# agent-loop.toml — three plan strategies, equal selector tie-break weight
+[[strategies]]
+provider = "claude/default"
+weight = 1.0
+
+[[strategies]]
+provider = "gemini/gemini-2.5-flash"
+weight = 1.0
+
+[[strategies]]
+provider = "cursor/auto"
+weight = 1.0
+```
+
+Or short form (all weight=1.0):
+
+```toml
+[runtime]
+strategies = ["claude/default", "gemini/gemini-2.5-flash", "cursor/auto"]
+```
+
+Or per-run via the CLI (overrides config):
+
+```bash
+agent-loop run "..." \
+  --strategy claude/default \
+  --strategy gemini/gemini-2.5-flash \
+  --strategy cursor/auto
+```
+
+Or via env var (comma-separated, weight=1.0 each):
+
+```bash
+export AGENT_LOOP_RUNTIME_STRATEGIES="claude/default,gemini/gemini-2.5-flash,cursor/auto"
+agent-loop bench binary_search --cycles 1
+```
+
+### How the Selector picks a winner (v0.3.0)
+
+1. **Structural score** (LLM-free): length (clamp 200..4000 chars), code-fence presence,
+   numbered-step count (log-scaled), header count (log-scaled). Weighted sum lands in
+   [0, 1].
+2. **LLM rubric** (one extra `cfg.models.plan` call): asks the planning model to rank
+   every proposal in `[0, 1]`. JSON output `{winner_index, reason, scores: list[float]}`.
+3. **Final score** = `0.6 * llm + 0.4 * structural` when the LLM call succeeded;
+   structural-only otherwise (`selector_method = "fallback"`).
+4. **Tie-break**: higher `StrategySpec.weight` wins; if still tied, the lower input
+   index wins (deterministic).
+
+If only one strategy is configured the selector is skipped entirely (`selector_method
+= "single"`, no LLM cost).
+
+### Output schema
+
+`artifacts/plan.md` is the **winner's text verbatim**, so every downstream phase
+(Implement / Verify / Judge) is unaware of the fan-out. Two new audit artifacts:
+
+`artifacts/proposals.json`:
+
+```jsonc
+{
+  "proposals": [
+    {"provider": "claude/default", "weight": 1.0, "text": "...", "cost_usd": 0.0,
+     "latency_s": 4.2, "tokens_in": 0, "tokens_out": 0, "error": null},
+    // ...
+  ]
+}
+```
+
+`artifacts/plan_selector.json`:
+
+```jsonc
+{
+  "winner_index": 0,
+  "winner_provider": "claude/default",
+  "selector_method": "heuristic+llm",
+  "selector_error": null,
+  "selector_reason": "more concrete steps + benchmark threshold called out",
+  "scores": [
+    {"provider": "claude/default", "structural": 0.82, "llm": 0.91, "final": 0.876, "error": null},
+    {"provider": "cursor/auto",   "structural": 0.74, "llm": 0.70, "final": 0.716, "error": null}
+  ]
+}
+```
+
+### Failure handling
+
+- **One strategy fails** (timeout / parse error): recorded as `proposal[i].error`. The
+  Selector runs over the remaining valid proposals.
+- **All strategies fail**: `AllStrategiesFailed` is raised; the orchestrator treats it
+  as an explicit cycle error (no silent fallback). Use a single `[runtime].plan` model
+  if you want graceful degradation.
+- **Selector LLM fails**: structural-only fallback (`selector_method = "fallback"`,
+  `selector_error` populated).
+- **Single proposal**: selector skipped, winner is that proposal.
+
+### Caveats
+
+- Recommended N ≤ 3 (same shared-cluster constraints as multi-judge).
+- The LLM rubric uses your *plan* model — if you set that to a slow CLI like
+  `claude/default`, expect the rubric to add ~10 s on top of the parallel critical path.
+- `selector_method == "fallback"` is captured on the plan metric row in
+  `metrics.jsonl` so observers can detect rubric outages.
+
 ## Configuration
 
 Default location: `~/.agent-loop/config.toml`. Override with `./agent-loop.toml` (project-local)
@@ -275,6 +550,8 @@ max_redo   = 3
 | `AGENT_LOOP_RUNTIME_SANDBOX` | `[runtime].sandbox` | bool |
 | `AGENT_LOOP_RUNTIME_MAX_CYCLES` | `[runtime].max_cycles` | int |
 | `AGENT_LOOP_RUNTIME_MAX_REDO` | `[runtime].max_redo` | int |
+| `AGENT_LOOP_RUNTIME_JUDGES` | `[runtime].judges` (v0.3) | comma-separated providers (weight=1.0 each) |
+| `AGENT_LOOP_RUNTIME_STRATEGIES` | `[runtime].strategies` (v0.3) | comma-separated providers (weight=1.0 each) |
 
 ### Provider credentials
 
