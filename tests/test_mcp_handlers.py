@@ -68,9 +68,10 @@ def test_tools_call_run_invokes_orchestrator(
     captured: dict[str, Any] = {}
 
     class _FakeOrch:
-        def __init__(self, td: TaskDir, cfg: Config) -> None:
+        def __init__(self, td: TaskDir, cfg: Config, *, console: Any = None) -> None:
             captured["td"] = td
             captured["cfg"] = cfg
+            captured["console"] = console
 
         def run(self, *, task: str, max_cycles: int, mode: str, max_redo: int) -> dict[str, Any]:
             captured.update(task=task, cycles=max_cycles, mode=mode, redo=max_redo)
@@ -187,6 +188,41 @@ def test_unknown_method_returns_method_not_found(handlers: Handlers) -> None:
     resp = handlers.dispatch("does/not/exist", {}, rid=10)
     assert resp.error is not None
     assert resp.error["code"] == ERR_METHOD_NOT_FOUND
+
+
+def test_tool_run_passes_stderr_console_to_orchestrator(
+    handlers: Handlers, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.5.1 fix: MCP `_tool_run` must inject a stderr Console so progress
+    chatter never pollutes the JSON-RPC stdout channel.
+    """
+    import sys as _sys
+
+    captured: dict[str, Any] = {}
+
+    class _FakeOrch:
+        def __init__(self, td: TaskDir, cfg: Config, *, console: Any = None) -> None:
+            captured["console"] = console
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "task_id": "x",
+                "cycles_run": 1,
+                "final_status": "stop",
+                "best_solution_path": None,
+                "total_cost_usd": 0.0,
+            }
+
+    monkeypatch.setattr("agent_loop.orchestrator.Orchestrator", _FakeOrch)
+    resp = handlers.dispatch(
+        "tools/call",
+        {"name": "agent_loop.run", "arguments": {"task": "noop", "cycles": 1}},
+        rid=11,
+    )
+    assert resp.error is None
+    console = captured["console"]
+    assert console is not None, "MCP must inject a Console (not None default)"
+    assert console.file is _sys.stderr, "Console must write to stderr, not stdout"
 
 
 def test_resource_specs_match_handlers_implementation() -> None:

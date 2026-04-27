@@ -8,9 +8,12 @@ server loop.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from rich.console import Console
 
 from agent_loop import __version__ as _agent_loop_version
 from agent_loop.config import Config
@@ -243,7 +246,7 @@ class Handlers:
         # Late import to avoid circulars and to honor stateless leaf principle.
         from agent_loop.orchestrator import Orchestrator
 
-        orch = Orchestrator(td, cfg)
+        orch = Orchestrator(td, cfg, console=_stderr_console())
         result = orch.run(task=task, max_cycles=cycles, mode=mode, max_redo=max_redo)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -307,7 +310,7 @@ class Handlers:
 
         from agent_loop.orchestrator import Orchestrator
 
-        orch = Orchestrator(td, self.config)
+        orch = Orchestrator(td, self.config, console=_stderr_console())
         result = orch.run(task=task_text, max_cycles=cycles, mode="auto", max_redo=max_redo)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -343,7 +346,7 @@ class Handlers:
 
         from agent_loop.orchestrator import Orchestrator
 
-        orch = Orchestrator(td, self.config)
+        orch = Orchestrator(td, self.config, console=_stderr_console())
         result = orch.run(task=task_text, max_cycles=cycles, mode="auto", max_redo=max_redo)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -440,6 +443,17 @@ class _NotFoundError(Exception):
 
 class _BadParamsError(Exception):
     """Raised on malformed tool / resource params."""
+
+
+def _stderr_console() -> Console:
+    """Build a rich Console that writes to stderr, with no ANSI styling.
+
+    The MCP stdio transport reserves stdout for newline-delimited JSON-RPC
+    frames; any progress chatter from the orchestrator must therefore go to
+    stderr. ``force_terminal=False`` keeps the output free of ANSI escape
+    codes so log scrapers see plain text.
+    """
+    return Console(file=sys.stderr, force_terminal=False)
 
 
 def _wrap_text(text: str) -> dict[str, Any]:

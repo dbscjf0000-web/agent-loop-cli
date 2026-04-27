@@ -125,18 +125,78 @@
   `agent-loop mcp tools` / `agent-loop mcp resources`. handler 분기: `Handlers.dispatch
   (method, params, rid) -> Response` 가 `_PrivacyError`/`_NotFoundError`/`_BadParams
   Error`/일반 Exception 모두 잡아 JSON-RPC error 로 wrap (server loop 절대 안 죽음).
-- ⚠️ v0.5.0 KNOWN BUG (라이브 검증으로 발견, 2026-04-27): orchestrator 의 rich
-  Console (default `Console()`) 가 stdout 으로 progress (`>>> Cycle 1/1`,
-  `> research (cycle 1)`, `judge: better=True ...`) 를 찍음 → MCP stdio 모드
-  에서 JSON-RPC frame 사이에 노이즈 라인이 끼어 client 가 JSON parse 실패. tool
-  call 자체는 성공해서 마지막 줄에 `{"jsonrpc":"2.0",...}` 가 나옴. 클라이언트는
-  `startswith("{")` + json.loads + `id` 매칭으로 필터해야 동작. v0.5.1 수정 후보:
-  `serve_stdio` 가 Orchestrator 에 `Console(file=sys.stderr)` 주입.
+- v0.5.0 KNOWN BUG → v0.5.1 FIXED: orchestrator 의 rich Console (default
+  `Console()`) 가 stdout 으로 progress 를 찍어 MCP stdio JSON-RPC frame 과
+  interleave 했음. v0.5.1 에서 `Handlers._tool_run/_resume/_bench` 가
+  `_stderr_console()` (Console(file=sys.stderr, force_terminal=False)) 주입 →
+  e2e 검증: stdout=332ch (1 JSON dict only, 0 non-JSON lines), stderr=62ch
+  (`>>> Cycle 1/1` + `> research (cycle 1)`). MCP client 의 non-JSON 필터 의존
+  해소.
+- v0.5.1 stdout/stderr 분리: `Orchestrator(td, cfg, console=...)` 가 진실의 단일
+  소스. CLI (`run`/`bench`/`resume`) 는 stdout `Console()` (사용자가 progress 봄),
+  MCP `_tool_run`/`_tool_resume`/`_tool_bench` 는 `_stderr_console()` 헬퍼로
+  `Console(file=sys.stderr, force_terminal=False)` 주입 → stdout 은 JSON-RPC
+  frame 만, stderr 가 progress 채널. 새 Orchestrator 사용처 추가 시 stdio MCP
+  안에서 호출되면 반드시 stderr console 주입 필수.
 - 라이브 subprocess e2e 검증 패턴: `tests/e2e_mcp_subprocess.py` 9 probes (initialize/
   tools_list/2 tools_call/resources_list/3 errors/exit), `tests/e2e_mcp_live_run.py`
   실제 `agent_loop.run` 호출. 실행: `LD_LIBRARY_PATH=/apps/applications/PYTHON/3.14.2/lib
   /apps/applications/PYTHON/3.14.2/bin/python3 tests/e2e_mcp_subprocess.py`. 두
   스크립트 모두 pytest 외부에 둠 (실 subprocess + 외부 LLM 의존이라 CI 부적합).
+
+---
+
+## [2026-04-27 25:30] - v0.5.1 fix: stdout interleave bug
+- 구현:
+  - `src/agent_loop/mcp/handlers.py`: `import sys`, `from rich.console import
+    Console`. 신규 helper `_stderr_console()` 가 `Console(file=sys.stderr,
+    force_terminal=False)` 반환 (ANSI 제거 → 로그 깨끗). `_tool_run`,
+    `_tool_resume`, `_tool_bench` 의 `Orchestrator(...)` 3 군데에 모두
+    `console=_stderr_console()` 주입 (CLI 호출처는 stdout default 그대로 OK).
+  - `src/agent_loop/__init__.py`: `0.5.0` -> `0.5.1`.
+  - `src/agent_loop/orchestrator.py`: 변경 X — v0.4 에서 이미 `console: Console
+    | None = None` 파라미터 + `self.console.print(...)` 로 routing 되어 있었음
+    (v0.5.0 의 진짜 버그는 MCP handlers 가 그 문 통해 stderr console 을 주입
+    안 한 것).
+- 변경 파일:
+  - `src/agent_loop/mcp/handlers.py` (~16 lines: import 2 + helper 9 + 3 사용처
+    각 1 line).
+  - `src/agent_loop/__init__.py` (1 line).
+  - `tests/test_mcp_handlers.py` (~30 lines: `_FakeOrch.__init__` 시그니처에
+    `*, console=None` 추가 + 신규 `test_tool_run_passes_stderr_console_to_
+    orchestrator` 1 test).
+  - `tests/test_orchestrator_console.py` (신규, ~120 lines, 3 tests):
+    `test_default_console_writes_to_stdout` / `test_injected_console_receives_
+    every_print` / `test_stderr_console_keeps_stdout_clean` (subprocess 없이
+    sys.stdout 임시 swap 으로 stdout 오염 검증).
+  - `README.md` (Status 헤더에 v0.5.1 entry, Known issue 섹션 → "Fixed in v0.5.1").
+  - `docs/architecture.md` (header v0.5.0-dev → v0.5.1-dev, mcp/ 박스에 stderr
+    console 주입 1 줄).
+  - `progress.txt` (Codebase Patterns 1 줄 + 본 entry, v0.5.0 known-bug 줄 갱신).
+- 상태: 완료
+- 검증:
+  - pytest: 199 passed (195 baseline + 4 신규 console-routing + 0 regression).
+    test_orchestrator_console.py 3 + test_mcp_handlers.py 추가 1.
+  - subprocess e2e (e2e_mcp_subprocess.py): 9/9 probes OK, agentLoopVersion=
+    `0.5.1` 노출 정확. stderr empty (probe 들은 Orchestrator 호출 X).
+  - subprocess e2e (수동 agent_loop.run 호출, no API key 로 빠른 fail):
+    stdout 332 ch = 1 JSON-RPC error response only (0 non-JSON lines).
+    stderr 62 ch = `>>> Cycle 1/1 (redo=0/3, cost=$0.0000)` +
+    `  > research (cycle 1)` 두 progress line. v0.5.0 caveat 해소 명시.
+- 학습:
+  - 패턴: v0.4 에서 `Orchestrator.console` 주입 가능했지만 v0.5.0 MCP handlers
+    가 활용 안 했음 → 라이브 검증으로 발견. mock 단위 테스트 (`Handlers.dispatch`
+    직접 호출 + `_FakeOrch`) 는 stdout 오염을 못 잡음 — subprocess + pipe 분리만
+    검출 가능. v0.5.x 에 새 stdio binding 추가 시 동일 risk.
+  - 패턴: rich Console 의 `force_terminal=False` 는 ANSI escape 코드 제거 →
+    stderr 로그를 grep / awk 처리할 때 안전. file=sys.stderr 만 주면 TTY 감지
+    로 ANSI 가 끼어 들 수 있음. 두 옵션은 항상 페어로.
+  - 주의사항: `_FakeOrch.__init__` 시그니처는 prod Orchestrator 와 keyword 호환
+    이어야 함 (`*, console=None`). prod 호출처가 kwarg 만 추가해도 mock test 가
+    안 깨지도록 `**kw` 보다는 explicit `*, console=None` 가 readable.
+- 다음 할 일:
+  - 부모가 git commit/push 진행 (워커는 commit 금지).
+  - v0.5.x 후보: HTTP transport, async run + `agent_loop.status` polling.
 
 ---
 

@@ -7,6 +7,14 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.5.1** — Fixed a stdout/JSON-RPC interleave bug discovered in v0.5.0
+live verification. The orchestrator now accepts an injected `console=`
+parameter; the MCP server passes a stderr-bound `Console` so progress
+chatter (`>>> Cycle 1/1`, `> research (cycle 1)`, judge lines, ...) no
+longer pollutes the JSON-RPC stdout channel. CLI users still see progress
+on stdout (default unchanged). 199 unit tests passing (195 v0.5.0 + 4 new
+console-routing tests).
+
 **v0.5.0** — Model Context Protocol (MCP) server. Other AI clients (Claude
 Code, Cursor, OpenCode, ...) can now drive `agent-loop` via the standard
 JSON-RPC 2.0 stdio transport — six tools (`agent_loop.run` / `.list` /
@@ -15,8 +23,8 @@ JSON-RPC 2.0 stdio transport — six tools (`agent_loop.run` / `.list` /
 `agent-loop://global/patterns`). Built on stdlib only (no `mcp` SDK
 dependency). Privacy: cross-task is honored at the resource boundary —
 `global/patterns` is refused when `runtime.cross_task_memory=False`, and
-no other task's `task.md` / prompt is ever exposed. 195 unit tests passing
-(172 v0.4.2 + 23 MCP). HTTP transport reserved for v0.5.x.
+no other task's `task.md` / prompt is ever exposed. HTTP transport
+reserved for v0.5.x.
 
 - **v0.4.0** — cross-task global memory. ContextEngine now snapshots a slice of
   `~/.agent-loop/global/patterns.md` and the orchestrator commits this task's
@@ -756,11 +764,13 @@ Restart Claude Code; the six tools appear in `/mcp` and Claude can call
 - The server processes one request at a time. Concurrent `agent_loop.run`
   calls from multiple clients are serialized — race-safe but slow.
 - `mcp serve --transport http` exits with code 2 — use stdio for now.
-- **Known issue (v0.5.0)**: the orchestrator's rich progress prints
-  (`>>> Cycle 1/1`, `> research (cycle 1)`, etc.) go to stdout and
-  interleave with JSON-RPC frames during `agent_loop.run`. MCP clients
-  must filter non-JSON lines. To be fixed in v0.5.1 by routing rich
-  Console to stderr when serving over stdio.
+- **Fixed in v0.5.1**: the orchestrator's rich progress prints
+  (`>>> Cycle 1/1`, `> research (cycle 1)`, etc.) used to go to stdout
+  and interleave with JSON-RPC frames during `agent_loop.run`. The MCP
+  server now constructs `Console(file=sys.stderr, force_terminal=False)`
+  and injects it into every `Orchestrator` it builds, so stdout stays a
+  pure JSON-RPC channel. CLI users (`agent-loop run` / `bench`) keep the
+  default stdout `Console()`.
 
 ### Live verified (2026-04-27)
 

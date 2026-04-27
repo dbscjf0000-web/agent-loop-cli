@@ -1,4 +1,4 @@
-# agent-loop-cli — Architecture (v0.5.0-dev)
+# agent-loop-cli — Architecture (v0.5.1-dev)
 
 This document is a focused extract of `docs/plan-v0.1.md` section 5, plus the v0.2
 Context Engine, the v0.2 multi-axis Verify Engine, the v0.3 multi-judge Judge Engine,
@@ -67,7 +67,7 @@ Engine each dispatch to N parallel ``call_model`` calls via
 | Module | Responsibility | Key types |
 |---|---|---|
 | `cli.py` | typer CLI surface: `run / list / resume / bench / config / models / memory / mcp`. Owns rich console output. | `app` (Typer) |
-| `mcp/` (v0.5) | Model Context Protocol server. JSON-RPC 2.0 over stdio (HTTP reserved for v0.5.x). Six tools (`agent_loop.{run,list,status,resume,bench,memory_show}`) and four resources (`agent-loop://task/{id}/{solution,memory,metrics}`, `agent-loop://global/patterns`). Stateless dispatch: every tool call constructs fresh `TaskDir` / `Orchestrator`. Privacy: refuses `agent-loop://global/*` when `cross_task_memory=False`; never exposes other tasks' `task.md` or prompts. Stdlib only — no `mcp` SDK dependency. | `Handlers`, `serve_stdio`, `Request`, `Response`, `TOOL_SPECS`, `RESOURCE_SPECS` |
+| `mcp/` (v0.5) | Model Context Protocol server. JSON-RPC 2.0 over stdio (HTTP reserved for v0.5.x). Six tools (`agent_loop.{run,list,status,resume,bench,memory_show}`) and four resources (`agent-loop://task/{id}/{solution,memory,metrics}`, `agent-loop://global/patterns`). Stateless dispatch: every tool call constructs fresh `TaskDir` / `Orchestrator`. v0.5.1: Orchestrator is built with `console=Console(file=sys.stderr, force_terminal=False)` so stdout stays a pure JSON-RPC channel and progress chatter goes to stderr. Privacy: refuses `agent-loop://global/*` when `cross_task_memory=False`; never exposes other tasks' `task.md` or prompts. Stdlib only — no `mcp` SDK dependency. | `Handlers`, `serve_stdio`, `Request`, `Response`, `TOOL_SPECS`, `RESOURCE_SPECS` |
 | `orchestrator.py` | The R->P->I->V->J loop. Resume from checkpoint, rollback on judge regression, budget guard. | `Orchestrator`, `RunResult` |
 | `workers.py` | One pure function per phase. Reads + writes `TaskDir`, calls the model router. **No state across calls.** | `run_research / run_plan / run_implement / run_verify / run_judge` |
 | `models.py` | Single `call_model(phase, prompt, system, config)` entry point. Dispatches CLI model ids (`cursor/<m>`, `claude/<m>`, `gemini/<m>`) to local subprocess adapters (`_call_cursor_cli` / `_call_claude_cli` / `_call_gemini_cli` — no API key, uses each CLI's own login) via the `_cli_provider()` helper; everything else goes to litellm (`_call_litellm`). Tracks tokens / cost / latency; one retry on rate-limit. | `ModelResponse`, `call_model`, `_call_cursor_cli`, `_call_claude_cli`, `_call_gemini_cli` |
