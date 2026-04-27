@@ -301,6 +301,107 @@ for the cursor->gemini direction with a real, multi-call free-form trace.
 2. **`claude/default` verify timeout** on free-form Verify is real, not a
    transient — bump `cli_timeout` or pick a smaller verifier.
 
+#### Multi-judge + multi-strategy live verify (v0.3, 2026-04-27)
+
+Closes the "judge skipped on cycle 1" gap above by enabling
+`runtime.judge_always_llm = true`, which disables the first-cycle short-circuit
+and forces a real LLM judge invocation even when there is no prior `best_solution`
+to compare against. Both v0.3 features are exercised in the same run on a tiny
+free-form task `reverse_words(s)` with **3 plan strategies** + **3 consensus judges**
+across all three vendors (cursor, gemini-flash, claude). `task_id=9380cc`.
+
+```toml
+# agent-loop.toml — abridged
+[runtime]
+judge_always_llm = true
+cli_timeout         = 600
+cli_timeout_verify  = 1200
+
+[[runtime.strategies]]
+provider = "cursor/auto"
+weight = 1.0
+[[runtime.strategies]]
+provider = "gemini/gemini-2.5-flash"
+weight = 1.0
+[[runtime.strategies]]
+provider = "claude/default"
+weight = 1.0
+
+[[runtime.judges]]
+provider = "cursor/auto"
+weight = 1.0
+[[runtime.judges]]
+provider = "gemini/gemini-2.5-flash"
+weight = 1.0
+[[runtime.judges]]
+provider = "claude/default"
+weight = 1.0
+```
+
+**Multi-strategy result** (`artifacts/proposals.json` + `artifacts/plan_selector.json`):
+
+| # | provider                | error                  | text len | structural | llm score | final |
+|---|-------------------------|------------------------|----------|------------|-----------|-------|
+| 0 | cursor/auto             | none                   | 1465     | 0.458      | 0.96      | 0.759 |
+| 1 | gemini/gemini-2.5-flash | none                   | 2232     | 0.582      | 0.88      | **0.7607 (winner)** |
+| 2 | claude/default          | `claude CLI timed out` | 0        | 0.000      | n/a       | 0.000 |
+
+`selector_method = "heuristic+llm"` — the v0.3.0 LLM-anchored selector picked
+`gemini-2.5-flash` (final=0.7607) over cursor (0.759) by a 0.0017 margin, and the
+selector LLM correctly justified it ("Proposal #2 has no usable plan"). `plan.md`
+on disk is **byte-identical** to `proposals[winner_index].text`. Telemetry row:
+
+```json
+{"phase": "plan", "n_strategies": 3, "selector_method": "heuristic+llm",
+ "winner_index": 1, "winner_provider": "gemini/gemini-2.5-flash",
+ "latency_s": 89.256, "model": "(strategy: gemini/gemini-2.5-flash of 3)"}
+```
+
+**Multi-judge result** (`artifacts/judge_result.json`):
+
+| # | provider                | better | action | weighted_score | latency  | error                  |
+|---|-------------------------|--------|--------|----------------|----------|------------------------|
+| 0 | cursor/auto             | true   | stop   | 1.000          |   13.1 s | none                   |
+| 1 | gemini/gemini-2.5-flash | true   | stop   | 1.000          |   33.8 s | none                   |
+| 2 | claude/default          | false  | stop   | null           |  600.1 s | `claude CLI timed out` |
+
+Consensus: `n_judges=3`, `votes_action={"stop": 2.0}`, `votes_better={"true": 2.0,
+"false": 0.0}`, `fallback=false`. Two healthy vendors agreed on `stop`/`better=true`
+(claude excluded by error); `consensus.individual` keeps all three for audit.
+Telemetry:
+
+```json
+{"phase": "judge", "n_judges": 3, "votes_action": {"stop": 2.0},
+ "votes_better": {"true": 2.0, "false": 0.0}, "consensus_fallback": false,
+ "latency_s": 33.79, "model": "(consensus: 3 judges)"}
+```
+
+**`judge_always_llm` proof.** With this flag off (default), cycle 1 short-circuits
+without any LLM call (`latency_s=0.0`, `model="(skipped: first cycle)"`). With it on,
+every healthy judge actually ran an LLM call on cycle 1 — both `cursor/auto`
+(13.1 s) and `gemini/gemini-2.5-flash` (33.8 s) returned non-zero latency and
+real `reason` text in their `individual` entries, even though `best_solution.json`
+did not exist when the judges started. This was previously listed as a remaining
+limitation; v0.3.1 closes it.
+
+**Run stats:** total wall clock ~22 min (sum of phase latencies = 259.2 s / 4.3 min
+of real work, but each phase that includes `claude/default` waits its full 600 s
+timeout on the slowest leg — once in plan strategies, once in judge consensus).
+Per-phase: research 22.4 s (cursor), plan 89.3 s (3-strategy parallel, capped by
+the timed-out claude leg), implement 14.5 s (cursor), verify 99.3 s
+(gemini-flash, free-form), judge 33.8 s (3-judge parallel, also waiting on the
+600 s claude timeout in the background). Cycles=1, cost=$0 (cursor Pro +
+gemini-flash free tier); `final_status=stop`, `weighted_score=1.0`. The hot path
+stayed responsive thanks to `ThreadPoolExecutor` fan-out: cursor and gemini-flash
+finished plan in 22 / 89 s and judge in 13 / 34 s, while claude blocked the full
+600 s in the background of each phase.
+
+**Remaining limitation found:** `claude --print` (the `claude/default` provider)
+times out at 600 s on plan and judge prompts as well — not just verify.
+For multi-vendor consensus runs that include claude, set a higher
+`cli_timeout` or expect to lose the claude leg to error (consensus still works
+on the surviving 2 vendors with `fallback=false`).
+
 ## Multi-judge consensus (v0.3)
 
 The single LLM judge of v0.1/v0.2 can be replaced with **N parallel judges + weighted-majority

@@ -1,6 +1,8 @@
 ## Codebase Patterns (최상단 고정)
 - v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
 - 진짜 cross-vendor verify 증명 (2026-04-27): free-form `agent-loop run` (rubric 없음) + cursor→gemini-2.5-flash 조합으로 verify가 실제 LLM 호출됨 (15.25s, 한국어 evidence). 단 judge는 first cycle 에서 자동 skip ("no prior best") — 다중 vendor judge 증명은 score<1.0 task 필요. claude/default 는 free-form verify 에서 600s timeout 재현됨.
+- v0.3 multi-judge + multi-strategy + judge_always_llm 라이브 cross-vendor 검증 통과 (2026-04-27, task_id=9380cc): 3 strategies(cursor/gemini/claude) + 3 judges(동일) 1 cycle 동시 실행 — proposals.json 3개(cursor 1465ch / gemini 2232ch / claude timeout), plan_selector.json `selector_method="heuristic+llm"` winner=gemini-flash (LLM rationale="claude has no usable plan"), plan.md == winner.text byte-identical. judge_result.json `n_judges=3`, `votes_action={"stop":2.0}`, `votes_better={"true":2.0}`, individual 3개(cursor 13s/gemini 34s OK, claude 600s timeout), `fallback=false`. judge_always_llm=true 효과 증명: best=null 인 cycle 1 에서도 cursor/gemini 둘 다 latency_s>0 + reason 텍스트 = 진짜 LLM call. metrics.jsonl plan/judge row 에 `n_strategies`, `n_judges`, `winner_provider`, `consensus_fallback` 모두 정확 기록. 발견 한계: `claude --print` 는 plan/judge prompt 도 600s timeout 재현 (verify 만 아님) — multi-vendor 합의 시 claude leg 은 surviving 2 vendor 로 graceful degrade.
+- ⚠️ TOML 작성시 `[[strategies]]`/`[[judges]]` 가 아니라 `[[runtime.strategies]]`/`[[runtime.judges]]`. `judge_always_llm`/`cli_timeout*` 은 `[runtime]` 섹션 안. config.py 의 Runtime 모델이 nested. (라이브 검증 첫 시도 실패 원인.)
 - 이 프로젝트는 standalone CLI (Python). Claude Code 의존성 없음.
 - 모델 추상화: litellm + 3개 CLI provider (cursor / claude / gemini, 모두 subprocess).
   `cursor/<m>` / `claude/<m>` / `gemini/<m>` 모델 id는 `_cli_provider()` 헬퍼가
@@ -953,4 +955,58 @@
       cfg 를 복제하기 때문에 selector 호출 시 원본 cfg 는 손상되지 않음 (검증 됨).
     - `concurrent.futures.as_completed` 결과를 `dict[idx]` 로 저장 → 입력 순서 보존
       → 테스트의 `proposals[1].error` 같은 단언이 안정.
+---
+
+## [2026-04-27 17:55] - v0.3 라이브 검증 (multi-judge + multi-strategy + judge_always_llm)
+- 검증 워커 task: `/tmp/al_v03_live/`, task_id=9380cc, free-form `reverse_words(s)`,
+  3 strategies(cursor/gemini-flash/claude) + 3 judges(동일) 동시 활성화 + judge_always_llm=true.
+- 결과: e2e **성공** (final_status=stop, weighted_score=1.0, cycles_run=1, cost=$0).
+- multi-strategy 동작 증거 (artifacts/proposals.json + plan_selector.json):
+  - proposals 3개: cursor/auto OK(text 1465ch, structural 0.458, llm 0.96, final 0.759),
+    gemini-flash OK(text 2232ch, structural 0.582, llm 0.88, final **0.7607 winner**),
+    claude/default error="claude CLI timed out after 600s" (text 0ch, final 0.000).
+  - plan_selector.json: `winner_index=1`, `winner_provider="gemini/gemini-2.5-flash"`,
+    `selector_method="heuristic+llm"`, LLM rationale 정확 ("Proposal #2 has no usable plan").
+  - plan.md == proposals[1].text byte-identical (md5 09e41353c35e, 2232 bytes) — downstream 호환 OK.
+  - metrics.jsonl plan row: `n_strategies=3, selector_method=heuristic+llm, winner_index=1,
+    winner_provider=gemini/gemini-2.5-flash, latency_s=89.256, model="(strategy: gemini/gemini-2.5-flash of 3)"`.
+- multi-judge 동작 증거 (artifacts/judge_result.json):
+  - `consensus.n_judges=3`, individual 3개 모두 기록 (cursor weight=1.0 better=true score=1.0 latency=13.1s,
+    gemini-flash weight=1.0 better=true score=1.0 latency=33.8s, claude weight=1.0 better=false score=null
+    latency=600.1s error=timeout).
+  - `votes_action={"stop": 2.0}`, `votes_better={"true": 2.0, "false": 0.0}`, `fallback=false`.
+  - 합의 결과: action=stop, better=true (2:0 vote, claude 는 error 로 자동 제외).
+  - reason 은 `[provider]` 태그 + `\n---\n` concat 으로 다 vendor 의 코멘트 보존.
+  - metrics.jsonl judge row: `n_judges=3, votes_action={"stop":2.0}, votes_better={"true":2.0,"false":0.0},
+    consensus_fallback=false, latency_s=33.79, model="(consensus: 3 judges)"`.
+- judge_always_llm 효과 증거: best_solution.json 부재 cycle 1 인데도 cursor/gemini judge 둘 다
+  latency_s>0 + 비어있지 않은 reason 텍스트 = 진짜 LLM 호출됨. 이전 v0.2.1 검증의 "judge skipped on cycle 1"
+  caveat 해소.
+- 발견된 새 한계:
+  - `claude --print` (claude/default provider) 가 plan/judge prompt 에서도 **600s timeout 재현** —
+    이전엔 verify 만 알려진 문제. multi-vendor 합의 시 surviving 2 vendor 로 graceful degrade 되지만
+    critical path 가 600s 로 뻗음 (3 vendor 모두 ThreadPool 병렬이라 plan+judge 두 phase 에서 각각 600s).
+    완화책: cli_timeout 더 늘리거나 claude leg 빼기.
+- 변경 파일: README.md (Cross-vendor live e2e 섹션 아래 "Multi-judge + multi-strategy live verify (v0.3)"
+  서브섹션 추가, ~80 줄), progress.txt (Codebase Patterns 1줄 + 본 entry).
+- 코드 수정 0 (검증 워커 — 진단만).
+- 학습:
+  - 패턴:
+    - TOML config 작성 시 `[[strategies]]`/`[[judges]]` (top-level) 가 아니라
+      `[[runtime.strategies]]`/`[[runtime.judges]]`. `judge_always_llm`/`cli_timeout*` 도
+      `[runtime]` 섹션 안. 첫 시도 실패 (single-plan/single-judge 로 fallback 후 verify 에서 죽음).
+    - `judge_always_llm=true` + free-form 짧은 task 는 multi-judge 의 진짜 cross-vendor 검증 게이트.
+      v0.2.1 검증의 last gap 을 채움.
+    - `consensus.individual` 은 error 난 judge 도 보존 (audit) — `votes_*` 만 surviving 으로 계산.
+      운영자가 vendor 안정성 추적하기 좋음.
+  - 주의사항:
+    - 라이브 호출 시 critical path 는 항상 가장 느린/timeout 한 vendor. 3 vendor 합의 + 3 plan
+      = 두 phase 에서 각각 가장 느린 vendor 의 latency. 비용 0 일지언정 시간 budget 잡아야 함.
+    - cursor/auto 의 selector LLM 호출은 plan 모델로 한 번 더 들어감 — selector 가 plan 모델
+      과 같으면 1 strategy 의 latency 가 두 번. 운영 중 분리 고려 (selector 전용 모델 옵션은 v0.3.1+).
+- 다음 할 일:
+  - claude/default 의 plan/judge timeout 원인 조사 (v0.3.2 후보): `--print` 가 agentic
+    하게 동작하는지, 단순 prompt 만 받으면 빠른지 측정해서 timeout 정책 차별화 필요한지 결정.
+  - 더 어려운 task 로 cycle 2+ multi-judge 검증 (action=redo_R/redo_P 가 실제 트리거되는지).
+  - selector 자체의 multi-judge 화 (Codebase Patterns 의 v0.3.1 후보 참조).
 ---
