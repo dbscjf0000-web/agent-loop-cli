@@ -1,9 +1,10 @@
-# agent-loop-cli — Architecture (v0.3-dev)
+# agent-loop-cli — Architecture (v0.4-dev)
 
 This document is a focused extract of `docs/plan-v0.1.md` section 5, plus the v0.2
 Context Engine, the v0.2 multi-axis Verify Engine, the v0.3 multi-judge Judge Engine,
-the v0.3 multi-strategy Strategy Engine, and the locations where future components
-plug in. See `docs/plan-v0.2.md` and `docs/plan-v0.3.md` for design rationale.
+the v0.3 multi-strategy Strategy Engine, the v0.4 cross-task global memory, and the
+locations where future components plug in. See `docs/plan-v0.2.md`,
+`docs/plan-v0.3.md`, and `docs/plan-v0.4.md` for design rationale.
 
 ## 1. Layered view
 
@@ -152,10 +153,22 @@ makes sense (KISS / YAGNI; see `progress.txt`). Future work has known extraction
         |                                  enabled by `runtime.strategies`
         |                                    (TOML / --strategy / env)
         |
+        +-- [DONE v0.4] Cross-task Memory -- ContextEngine.commit_to_global() at run end +
+        |                                    snapshot() includes ~/.agent-loop/global/
+        |                                    patterns.md slice. Privacy: only CORE: lines
+        |                                    + one-line task summary leave the task dir.
+        |                                    enabled by `runtime.cross_task_memory` (default ON)
+        |                                    CLI: `agent-loop memory {show,list,wipe,path}`
+        |
         +-- (v0.3) LLM Compactor      -- swap rule-based body of context.compact()
         |                                with an LLM-backed summarizer behind same iface
         |
-        +-- (v0.4) Tool / MCP Bridge  -- workers.py:run_implement currently writes solution.py
+        +-- (v0.4.1) MCP Server Bridge-- expose ~/.agent-loop/global/ via the Model Context
+        |                                Protocol so external IDEs / agents can read+write
+        |                                patterns.md. Hooks already in place:
+        |                                ContextEngine.commit_to_global / _load_global_patterns
+        |
+        +-- (v0.5) Tool / MCP Bridge  -- workers.py:run_implement currently writes solution.py
                                          only; agent-style tool use needs a layer below
 ```
 

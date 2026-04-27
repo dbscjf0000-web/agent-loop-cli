@@ -39,17 +39,31 @@ from agent_loop.state import TaskDir
 
 @dataclass
 class MemorySnapshot:
-    """Phase-prompt input. ``ContextEngine.snapshot()`` returns this."""
+    """Phase-prompt input. ``ContextEngine.snapshot()`` returns this.
+
+    v0.4 adds ``global_patterns`` — a slice of the user-global ``patterns.md``
+    that is appended (when non-empty) so workers see prior cross-task learning.
+    """
 
     episodic: str
     core_facts: str
     history_count: int
+    global_patterns: str = ""  # v0.4: cross-task patterns from ~/.agent-loop/global/
 
     def render(self) -> str:
-        """Default rendering used by phase workers as the ``{memory}`` slot."""
+        """Default rendering used by phase workers as the ``{memory}`` slot.
+
+        Conditionally appends a ``# Global Patterns (cross-task)`` section when
+        ``global_patterns`` is non-empty, so v0.3 prompts that never saw the
+        section continue to render byte-identically when the feature is off.
+        """
         ep = self.episodic.strip() or "(none)"
         cf = self.core_facts.strip() or "(none)"
-        return f"# Episodic\n{ep}\n\n# Core Facts\n{cf}"
+        gp = self.global_patterns.strip()
+        out = f"# Episodic\n{ep}\n\n# Core Facts\n{cf}"
+        if gp:
+            out += f"\n\n# Global Patterns (cross-task)\n{gp}"
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -67,16 +81,41 @@ _CORE_PREFIX = "CORE:"
 # Match `cycle N` at end-of-line for compactor grouping.
 _CYCLE_RE = re.compile(r"cycle\s+(\d+)", re.IGNORECASE)
 
+# v0.4 cross-task memory defaults. The orchestrator passes runtime config
+# overrides through ``ContextEngine.__init__`` so these are only the ultimate
+# fallback (e.g. when a worker constructs an engine without a Config in scope).
+_DEFAULT_GLOBAL_ROOT = "~/.agent-loop/global"
+_DEFAULT_GLOBAL_MAX_CHARS = 4000
+
 
 class ContextEngine:
     """3-tier memory + rule-based compactor + sensor heuristics.
 
     All methods are safe to call on a partially-initialised task directory:
     ``init()`` is idempotent and the readers tolerate missing files.
+
+    v0.4 adds optional cross-task memory. When ``cross_task=True`` (default),
+    ``snapshot()`` includes a slice of ``<global_root>/patterns.md`` and
+    ``commit_to_global()`` (typically called by the orchestrator at run end)
+    appends new ``CORE:`` lines + a one-line task summary to that directory.
+    Disabling ``cross_task`` reverts to v0.3 behaviour exactly.
     """
 
-    def __init__(self, task_dir: TaskDir) -> None:
+    def __init__(
+        self,
+        task_dir: TaskDir,
+        *,
+        global_root: Path | str | None = None,
+        cross_task: bool = True,
+        global_max_chars: int = _DEFAULT_GLOBAL_MAX_CHARS,
+    ) -> None:
         self.task_dir = task_dir
+        # ``global_root`` is stored unresolved; ``_global_dir()`` expands ~ at
+        # access time so a config change between construction and call is
+        # honoured (rare, but matches the rest of the engine's lazy-IO style).
+        self._global_root = global_root if global_root is not None else _DEFAULT_GLOBAL_ROOT
+        self._cross_task = bool(cross_task)
+        self._global_max_chars = int(global_max_chars)
 
     # ------------------------------------------------------------------
     # paths
@@ -104,6 +143,23 @@ class ContextEngine:
     @property
     def _legacy_backup_path(self) -> Path:
         return self.task_dir.path / "memory.txt.v0_1.bak"
+
+    # ------------------------------------------------------------------
+    # v0.4: cross-task / global memory paths
+    # ------------------------------------------------------------------
+    def _global_dir(self) -> Path:
+        """Expanded global directory (e.g. ``~/.agent-loop/global``).
+
+        Always returns a Path; never creates the directory (callers do that
+        explicitly when committing — readers tolerate absence).
+        """
+        return Path(str(self._global_root)).expanduser()
+
+    def _global_patterns_path(self) -> Path:
+        return self._global_dir() / "patterns.md"
+
+    def _global_index_path(self) -> Path:
+        return self._global_dir() / "task_index.jsonl"
 
     # ------------------------------------------------------------------
     # init / migration
@@ -145,10 +201,16 @@ class ContextEngine:
     # reads
     # ------------------------------------------------------------------
     def snapshot(self) -> MemorySnapshot:
-        """Return current episodic + core_facts for prompt rendering.
+        """Return current episodic + core_facts (+ optional global) for prompt rendering.
 
         Tolerates missing files (returns empty strings). ``init()`` is the
         canonical creator but callers should not assume it ran.
+
+        v0.4: when ``cross_task=True`` is set on the engine, also reads a
+        bounded slice of ``<global_root>/patterns.md`` (most recent
+        ``global_max_chars`` bytes). The slice is empty if the global file
+        does not exist, so cross-task can be safely enabled before any task
+        has committed.
         """
         ep = self._read_or_empty(self._episodic_path)
         cf = self._read_or_empty(self._core_facts_path)
@@ -159,7 +221,113 @@ class ContextEngine:
             if legacy.strip():
                 cf = legacy
         count = self._count_lines(self._history_path)
-        return MemorySnapshot(episodic=ep, core_facts=cf, history_count=count)
+        gp = self._load_global_patterns(self._global_max_chars) if self._cross_task else ""
+        return MemorySnapshot(
+            episodic=ep, core_facts=cf, history_count=count, global_patterns=gp
+        )
+
+    # ------------------------------------------------------------------
+    # v0.4: cross-task / global memory I/O
+    # ------------------------------------------------------------------
+    def _load_global_patterns(self, max_chars: int | None = None) -> str:
+        """Return the trailing ``max_chars`` of ``patterns.md`` (or empty).
+
+        Trailing slice (newest first by append order) keeps the most recently
+        committed patterns when the file outgrows the budget. ``max_chars=None``
+        means "use the engine default". Honors the ``cross_task`` flag — if
+        cross-task is disabled, returns ``""`` without touching disk.
+        """
+        if not self._cross_task:
+            return ""
+        budget = self._global_max_chars if max_chars is None else int(max_chars)
+        text = self._read_or_empty(self._global_patterns_path())
+        if not text:
+            return ""
+        if budget <= 0 or len(text) <= budget:
+            return text
+        # Slice from the end and snap to the next newline so we don't break a
+        # CORE: line in half. If no newline survives, fall back to raw slice.
+        tail = text[-budget:]
+        nl = tail.find("\n")
+        if 0 <= nl < len(tail) - 1:
+            tail = tail[nl + 1 :]
+        return tail
+
+    def commit_to_global(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Persist this task's CORE: lines + a one-line summary into the global dir.
+
+        Called by the orchestrator at run end (any final_status). Idempotent:
+        running it twice for the same ``task_id`` will not duplicate lines in
+        ``patterns.md`` (exact-match dedup) nor in ``task_index.jsonl`` (set
+        check on prior task_ids).
+
+        Returns a stat dict ``{committed, patterns_added, index_added,
+        reason}`` so callers can log or test the outcome. When cross-task is
+        disabled, returns ``{"committed": False, "reason": "disabled"}``
+        without touching disk.
+        """
+        if not self._cross_task:
+            return {"committed": False, "patterns_added": 0, "index_added": 0, "reason": "disabled"}
+
+        gdir = self._global_dir()
+        try:
+            gdir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:  # pragma: no cover - defensive
+            return {"committed": False, "patterns_added": 0, "index_added": 0, "reason": f"mkdir failed: {e}"}
+
+        # --- patterns.md: dedup-append CORE: lines from this task's core_facts.md ---
+        local_core = self._read_or_empty(self._core_facts_path)
+        local_lines = [
+            ln.strip()
+            for ln in local_core.splitlines()
+            if ln.strip().startswith(_CORE_PREFIX)
+        ]
+        existing = {
+            ln.strip()
+            for ln in self._read_or_empty(self._global_patterns_path()).splitlines()
+            if ln.strip().startswith(_CORE_PREFIX)
+        }
+        new_lines = []
+        for ln in local_lines:
+            if ln not in existing:
+                new_lines.append(ln)
+                existing.add(ln)  # in-batch dedup too
+        if new_lines:
+            ppath = self._global_patterns_path()
+            tail = ("\n" if (ppath.exists() and ppath.read_text(encoding="utf-8").strip() and not ppath.read_text(encoding="utf-8").endswith("\n")) else "")
+            with ppath.open("a", encoding="utf-8") as f:
+                f.write(tail + "\n".join(new_lines) + "\n")
+
+        # --- task_index.jsonl: idempotent append (skip if task_id already present) ---
+        idx_path = self._global_index_path()
+        task_id = str(summary.get("task_id", ""))
+        already_indexed = False
+        if task_id and idx_path.exists():
+            for line in idx_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(rec.get("task_id", "")) == task_id:
+                    already_indexed = True
+                    break
+
+        index_added = 0
+        if task_id and not already_indexed:
+            row = {"timestamp": time.time(), **summary}
+            with idx_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            index_added = 1
+
+        return {
+            "committed": True,
+            "patterns_added": len(new_lines),
+            "index_added": index_added,
+            "reason": "ok",
+        }
 
     # ------------------------------------------------------------------
     # writes

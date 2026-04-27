@@ -63,6 +63,12 @@ app = typer.Typer(
 )
 config_app = typer.Typer(name="config", help="Manage agent-loop config.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
+memory_app = typer.Typer(
+    name="memory",
+    help="(v0.4) Manage cross-task global memory (~/.agent-loop/global/).",
+    no_args_is_help=True,
+)
+app.add_typer(memory_app, name="memory")
 
 console = Console()
 
@@ -134,6 +140,13 @@ def _override_runtime_v031(
     return cfg
 
 
+def _override_runtime_v04(cfg: Config, *, no_cross_task: bool) -> Config:
+    """v0.4 — apply --no-cross-task (one-shot opt-out, leaves config TOML alone)."""
+    if no_cross_task:
+        cfg.runtime.cross_task_memory = False
+    return cfg
+
+
 @app.command("run")
 def cmd_run(
     task: str = typer.Argument(..., help="Task description (free-form prose)."),
@@ -176,6 +189,11 @@ def cmd_run(
         help="(v0.3.1) Disable the first-cycle short-circuit and always invoke the judge LLM. "
         "Required for genuine multi-judge cross-vendor verification when score>=0.95 on cycle 1.",
     ),
+    no_cross_task: bool = typer.Option(
+        False,
+        "--no-cross-task",
+        help="(v0.4) Disable cross-task global memory for this run only (does not modify config).",
+    ),
 ) -> None:
     """Run a fresh task through the loop."""
     if mode not in ("auto", "supervised"):
@@ -191,6 +209,7 @@ def cmd_run(
         cli_timeout_judge=cli_timeout_judge,
         judge_always_llm=judge_always_llm,
     )
+    cfg = _override_runtime_v04(cfg, no_cross_task=no_cross_task)
     tid = task_id or new_task_id()
     td = TaskDir(root=root, task_id=tid)
     td.init()
@@ -305,6 +324,11 @@ def cmd_bench(
         "--judge-always-llm",
         help="(v0.3.1) Disable judge first-cycle short-circuit (always call LLM).",
     ),
+    no_cross_task: bool = typer.Option(
+        False,
+        "--no-cross-task",
+        help="(v0.4) Disable cross-task global memory for this run only.",
+    ),
 ) -> None:
     """Run a benchmark task from benchmarks/."""
     bench_dir = _find_benchmarks_dir()
@@ -329,6 +353,7 @@ def cmd_bench(
         cli_timeout_judge=cli_timeout_judge,
         judge_always_llm=judge_always_llm,
     )
+    cfg = _override_runtime_v04(cfg, no_cross_task=no_cross_task)
     for n in names:
         path = bench_dir / f"{n}.yaml"
         if not path.exists():
@@ -748,6 +773,104 @@ def cmd_config_edit(
         target.write_text(_DEFAULT_TOML, encoding="utf-8")
     editor = os.environ.get("EDITOR") or shutil.which("vim") or shutil.which("vi") or "vi"
     subprocess.call([editor, str(target)])
+
+
+# ---------------------------------------------------------------------------
+# memory (v0.4)
+# ---------------------------------------------------------------------------
+def _global_dir(config_path: Optional[Path] = None) -> Path:
+    """Resolve the cross-task memory directory from config (env-overridable)."""
+    cfg = load_config(config_path)
+    return Path(cfg.runtime.cross_task_memory_dir).expanduser()
+
+
+@memory_app.command("path")
+def cmd_memory_path(
+    config_path: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Print the cross-task memory directory path."""
+    d = _global_dir(config_path)
+    typer.echo(str(d))
+
+
+@memory_app.command("show")
+def cmd_memory_show(
+    limit: int = typer.Option(50, "--limit", help="Show the last N lines (default 50)."),
+    config_path: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Print the last N lines of patterns.md."""
+    d = _global_dir(config_path)
+    p = d / "patterns.md"
+    if not p.exists():
+        console.print(f"[yellow]no patterns.md at {p}[/yellow]")
+        return
+    text = p.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        console.print("[yellow](patterns.md is empty)[/yellow]")
+        return
+    tail = lines[-int(limit):] if limit > 0 else lines
+    for ln in tail:
+        console.print(ln)
+
+
+@memory_app.command("list")
+def cmd_memory_list(
+    config_path: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Show task_index.jsonl as a table."""
+    d = _global_dir(config_path)
+    p = d / "task_index.jsonl"
+    if not p.exists():
+        console.print(f"[yellow]no task_index.jsonl at {p}[/yellow]")
+        return
+    rows: list[dict] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not rows:
+        console.print("[yellow](task_index.jsonl is empty)[/yellow]")
+        return
+    table = Table(title=f"agent-loop tasks @ {p}")
+    table.add_column("task_id", style="magenta")
+    table.add_column("score", style="green")
+    table.add_column("cycles", style="cyan")
+    table.add_column("status", style="yellow")
+    table.add_column("first_line", style="white")
+    for r in rows:
+        ws = r.get("weighted_score")
+        score_s = f"{ws:.3f}" if isinstance(ws, (int, float)) else "-"
+        table.add_row(
+            str(r.get("task_id", "?"))[:12],
+            score_s,
+            str(r.get("cycles", "-")),
+            str(r.get("final_status", "-"))[:14],
+            (r.get("task_md_first_line") or "")[:60],
+        )
+    console.print(table)
+
+
+@memory_app.command("wipe")
+def cmd_memory_wipe(
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    config_path: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Delete the cross-task memory directory after confirmation."""
+    d = _global_dir(config_path)
+    if not d.exists():
+        console.print(f"[yellow]nothing to wipe — {d} does not exist[/yellow]")
+        return
+    if not yes:
+        if not typer.confirm(f"Permanently delete {d}? This cannot be undone."):
+            console.print("[yellow]aborted[/yellow]")
+            return
+    shutil.rmtree(d)
+    console.print(f"[bold green][OK][/bold green] wiped {d}")
 
 
 # ---------------------------------------------------------------------------

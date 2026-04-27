@@ -20,6 +20,9 @@ Environment variables can override individual fields:
   AGENT_LOOP_RUNTIME_CLI_TIMEOUT_VERIFY      (v0.3.1, per-phase override)
   AGENT_LOOP_RUNTIME_CLI_TIMEOUT_JUDGE       (v0.3.1, per-phase override)
   AGENT_LOOP_RUNTIME_JUDGE_ALWAYS_LLM        (v0.3.1, bool — disable first-cycle short-circuit)
+  AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY            (v0.4, bool — enable cross-task patterns.md)
+  AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_DIR        (v0.4, override ~/.agent-loop/global)
+  AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_MAX_CHARS  (v0.4, int — snapshot slice budget)
 """
 from __future__ import annotations
 
@@ -107,6 +110,15 @@ class Runtime(BaseModel):
     # cross-vendor multi-judge verification when score>=0.95 is reached on
     # cycle 1 (which would otherwise auto-stop without any judge LLM call).
     judge_always_llm: bool = False
+
+    # v0.4 — cross-task memory (per-user global learning).
+    # When True (default), ContextEngine.snapshot() includes a slice of
+    # ``<cross_task_memory_dir>/patterns.md`` and the orchestrator commits
+    # this task's CORE: lines + a one-line summary at run end. Set to False
+    # to revert to v0.3 single-task-only memory.
+    cross_task_memory: bool = True
+    cross_task_memory_dir: str = "~/.agent-loop/global"
+    cross_task_memory_max_chars: int = 4000
 
     def cli_timeout_for(self, phase: str) -> int:
         """Return the effective subprocess timeout (seconds) for ``phase``.
@@ -211,6 +223,10 @@ _ENV_MAP = {
     ("runtime", "cli_timeout_judge"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_JUDGE", int),
     # v0.3.1 judge_always_llm
     ("runtime", "judge_always_llm"): ("AGENT_LOOP_RUNTIME_JUDGE_ALWAYS_LLM", "bool"),
+    # v0.4 cross-task memory
+    ("runtime", "cross_task_memory"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY", "bool"),
+    ("runtime", "cross_task_memory_dir"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_DIR", str),
+    ("runtime", "cross_task_memory_max_chars"): ("AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_MAX_CHARS", int),
 }
 
 
@@ -291,6 +307,13 @@ cli_timeout         = 600
 # v0.3.1 - when true, disable the judge's first-cycle short-circuit and
 # always invoke the LLM (single or multi-judge consensus) even on cycle 1.
 judge_always_llm    = false
+
+# v0.4 - cross-task memory: persist CORE: lines + one-line task summaries
+# under <cross_task_memory_dir>/ so future tasks see prior learning.
+# Set to false to disable (reverts to v0.3 single-task memory).
+cross_task_memory               = true
+cross_task_memory_dir           = "~/.agent-loop/global"
+cross_task_memory_max_chars     = 4000
 """
 
 

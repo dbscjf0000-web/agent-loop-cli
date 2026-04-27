@@ -74,7 +74,14 @@ class Orchestrator:
         self._confirm_plan = confirm_plan
         # v0.2: Context Engine. init() is idempotent (safe on resume + creates
         # the memory/ layout, migrating any legacy memory.txt once).
-        self.context = ContextEngine(task_dir)
+        # v0.4: pass through cross-task memory config so snapshot() can include
+        # a slice of ~/.agent-loop/global/patterns.md and run() can commit at end.
+        self.context = ContextEngine(
+            task_dir,
+            global_root=config.runtime.cross_task_memory_dir,
+            cross_task=config.runtime.cross_task_memory,
+            global_max_chars=config.runtime.cross_task_memory_max_chars,
+        )
 
     # ------------------------------------------------------------------
     # public API
@@ -158,13 +165,7 @@ class Orchestrator:
                 if phase == "plan" and mode == "supervised":
                     if not self._ask_confirm("Plan written. Continue to implement?"):
                         final_status = "user_aborted"
-                        return RunResult(
-                            self.task_dir.task_id,
-                            cycles_run,
-                            final_status,
-                            self._best_solution_path(),
-                            total_cost,
-                        ).as_dict()
+                        return self._finalize(cycles_run, final_status, total_cost, task)
 
                 if total_cost > self.config.budget.per_run_usd:
                     self.console.print(
@@ -172,13 +173,7 @@ class Orchestrator:
                         f"${self.config.budget.per_run_usd:.4f})"
                     )
                     final_status = "budget_exceeded"
-                    return RunResult(
-                        self.task_dir.task_id,
-                        cycles_run,
-                        final_status,
-                        self._best_solution_path(),
-                        total_cost,
-                    ).as_dict()
+                    return self._finalize(cycles_run, final_status, total_cost, task)
 
             # ----- post-cycle judge handling -----
             j = self._read_judge_result()
@@ -227,17 +222,69 @@ class Orchestrator:
         else:
             final_status = "max_cycles"
 
-        return RunResult(
+        return self._finalize(cycles_run, final_status, total_cost, task)
+
+    # ------------------------------------------------------------------
+    # internals
+    # ------------------------------------------------------------------
+    def _finalize(
+        self, cycles_run: int, final_status: str, total_cost: float, task_text: str
+    ) -> dict[str, Any]:
+        """Build the RunResult dict and (v0.4) commit cross-task memory.
+
+        ``commit_to_global`` is best-effort — exceptions are caught and logged
+        as a console warning so a global-IO hiccup never breaks the run
+        contract. Called from every return path of ``run()``.
+        """
+        result = RunResult(
             self.task_dir.task_id,
             cycles_run,
             final_status,
             self._best_solution_path(),
             total_cost,
         ).as_dict()
+        try:
+            summary = self._build_global_summary(result, task_text)
+            stat = self.context.commit_to_global(summary)
+            if stat.get("committed"):
+                self.console.print(
+                    f"  [dim]global memory: +{stat.get('patterns_added', 0)} patterns, "
+                    f"+{stat.get('index_added', 0)} index row[/dim]"
+                )
+        except Exception as e:  # never break run() over global-IO
+            self.console.print(f"[yellow]global memory commit warning: {e}[/yellow]")
+        return result
 
-    # ------------------------------------------------------------------
-    # internals
-    # ------------------------------------------------------------------
+    def _build_global_summary(self, result: dict[str, Any], task_text: str) -> dict[str, Any]:
+        """Compose a privacy-conscious one-line summary for task_index.jsonl."""
+        first_line = ""
+        for line in (task_text or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                first_line = stripped[:200]
+                break
+        # Pull the latest weighted_score from solution.json (best available).
+        weighted_score: float | None = None
+        if self.task_dir.has_artifact("best_solution.json"):
+            best = self.task_dir.read_artifact("best_solution.json")
+            if isinstance(best, dict):
+                ws = best.get("weighted_score", best.get("score"))
+                if isinstance(ws, (int, float)):
+                    weighted_score = float(ws)
+        elif self.task_dir.has_artifact("solution.json"):
+            sol = self.task_dir.read_artifact("solution.json")
+            if isinstance(sol, dict):
+                ws = sol.get("weighted_score", sol.get("score"))
+                if isinstance(ws, (int, float)):
+                    weighted_score = float(ws)
+        return {
+            "task_id": self.task_dir.task_id,
+            "weighted_score": weighted_score,
+            "cycles": int(result.get("cycles_run", 0)),
+            "task_md_first_line": first_line,
+            "final_status": result.get("final_status", "unknown"),
+        }
+
     def _run_phase(self, phase: Phase, cycle: int) -> ModelResponse:
         self.console.print(f"  [yellow]>[/yellow] {phase} (cycle {cycle})")
         return _PHASE_FUNCS[phase](self.task_dir, self.config)

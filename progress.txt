@@ -83,7 +83,82 @@
   critical. `--add-dir=<workspace>` 등호 형식 필수 (nargs='*' 인 `--allowedTools` 가
   workspace 를 삼키는 것 방지). 패치 전 free-form claude verify=600s timeout, 패치 후 14.6s.
   claude ping 도 10.3s→7.1s 단축.
+- v0.4.0 cross-task memory: `~/.agent-loop/global/patterns.md` (CORE: 라인 dedup 누적) +
+  `task_index.jsonl` (한 줄 요약). `ContextEngine(td, global_root=..., cross_task=True,
+  global_max_chars=4000)` 로 생성. `commit_to_global({task_id, weighted_score, cycles,
+  task_md_first_line, final_status})` 가 orchestrator `_finalize` 에서 모든 exit path
+  마다 호출됨 (try/except 로 격리). `MemorySnapshot.global_patterns` 가 `# Global Patterns
+  (cross-task)` 섹션으로 prompt {memory} 슬롯에 자동 합쳐짐. cross_task=False 면 글로벌
+  IO 0. dedup 은 exact match. CLI: `agent-loop memory {show,list,wipe,path}`.
+  ENV: `AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY[_DIR|_MAX_CHARS]`. flag `--no-cross-task`
+  (한 번 끄기). MCP server 는 v0.4.1 에 `commit_to_global`/`_load_global_patterns` hooks
+  재사용. Privacy: 코드/prompt 본문 글로벌 X. task_md_first_line 만 (사용자가 첫 줄에
+  민감 정보 X 가정).
 
+---
+
+## [2026-04-27 22:00] - v0.4.0 cross-task memory
+- 구현:
+  - `src/agent_loop/context.py`: `MemorySnapshot.global_patterns: str = ""` 신규 필드,
+    `render()` 에 `# Global Patterns (cross-task)` 섹션을 비어있지 않을 때만 conditional
+    append (v0.3 prompt 와 byte-identical 보존). `ContextEngine.__init__` 에 3 신규 kwarg
+    (`global_root`, `cross_task=True`, `global_max_chars=4000`). 신규 메서드:
+    `_global_dir/_patterns_path/_index_path`, `_load_global_patterns(max_chars)` (trailing
+    slice + newline-snap), `commit_to_global(summary)` — `core_facts.md` 의 `CORE:` 라인
+    dedup 후 patterns.md 에 append, task_id 세트 검사로 task_index.jsonl idempotent append.
+    `mkdir(parents, exist_ok)` race-safe.
+  - `src/agent_loop/config.py`: `Runtime` 에 3 신규 필드 (`cross_task_memory: bool = True`,
+    `cross_task_memory_dir: str = "~/.agent-loop/global"`, `cross_task_memory_max_chars: int
+    = 4000`). `_ENV_MAP` 에 3 엔트리. `_DEFAULT_TOML` 에 주석 + 키 노출. 헤더 docstring
+    에 v0.4 ENV 3 줄.
+  - `src/agent_loop/orchestrator.py`: `__init__` 에서 ContextEngine 에 global_root /
+    cross_task / max_chars 전달. `run()` 의 모든 return 경로 (`user_aborted`,
+    `budget_exceeded`, `stop`, `max_redo`, `max_cycles`) 가 `_finalize(cycles_run, status,
+    cost, task)` 헬퍼 통과. `_finalize` 가 RunResult.as_dict() + try/except 안에서
+    `commit_to_global(_build_global_summary(...))` 호출. summary 는 best_solution / solution
+    의 weighted_score 폴백 + task_md 의 첫 비어있지 않은 라인 200ch.
+  - `src/agent_loop/cli.py`: 신규 `memory_app` (typer.Typer) 4 commands —
+    `memory path` / `memory show --limit N=50` / `memory list` (rich Table) / `memory wipe
+    [--yes]` (typer.confirm). `_override_runtime_v04(no_cross_task)` 헬퍼 + `run` / `bench`
+    에 `--no-cross-task` flag. `_global_dir(config_path)` 가 `load_config` → expanduser 로
+    환경변수 통일.
+  - `src/agent_loop/workers.py`: 변경 0 (기존 `_memory_text` 가 `MemorySnapshot.render()`
+    그대로 사용 → global_patterns 자동 포함).
+  - `src/agent_loop/__init__.py`: `__version__ = "0.4.0"`.
+  - `tests/test_cross_task.py` (11 tests): global_dir auto-create, dedup append,
+    task_index 한 task_id 한 줄, cross_task=False noop, snapshot 글로벌 포함, max_chars
+    truncate (newline-snap), idempotent commit, CORE: 라인만 추출, _load 가 disabled 시 ""
+    반환, 글로벌 파일 부재 시 ""+섹션 omit, 기본 생성자 backward compat (HOME monkeypatch).
+  - `tests/test_memory_cli.py` (6 tests): path 출력, show 부재시 메시지, show tail-N,
+    list rich Table, wipe --yes, wipe confirm 거부 시 보존.
+  - `tests/test_cross_task_e2e.py` (2 tests): orchestrator 1 cycle mock 끝에 patterns.md +
+    task_index.jsonl 작성됨, 두 번째 task 의 snapshot 이 첫 task 의 CORE 라인 봄.
+  - `docs/plan-v0.4.md` (~210줄), `docs/architecture.md` 에 Cross-task Memory + MCP 박스
+    추가, `README.md` Status v0.4.0 + "Cross-task memory (v0.4)" 섹션 (CLI / config /
+    privacy / caveats).
+- 변경 파일:
+  - 수정: src/agent_loop/{__init__,context,config,orchestrator,cli}.py, README.md,
+    docs/architecture.md
+  - 신규: docs/plan-v0.4.md, tests/test_cross_task.py, tests/test_memory_cli.py,
+    tests/test_cross_task_e2e.py
+- 상태: 완료 — pytest 132 → 151 (19 신규 모두 green, regression 0).
+- 다음 할 일:
+  - v0.4.1 워커: `src/agent_loop/mcp_server.py` 신규. MCP 표준 (`tools/list`,
+    `resources/list`, `resources/read`, `prompts/list`) 구현. read 백엔드 =
+    `ContextEngine._load_global_patterns()`, write 백엔드 = `ContextEngine.commit_to_global()`.
+    `agent-loop mcp serve [--stdio | --port N]` CLI 명령 추가. `~/.agent-loop/global/`
+    가 single source of truth.
+  - 라이브 cross-vendor 검증 (n_queens 두 task 연속 → 두 번째 task 가 첫 task 의 CORE 라인
+    실제 prompt 에 본다는 evidence 수집).
+- 학습:
+  - 패턴: orchestrator 의 다중 return 경로를 `_finalize(...)` 단일 헬퍼로 통일하면 모든
+    exit path 에 hook 끼우기 쉬움. try/except 안에 wrap 해야 외부 IO 가 run 결과 깨뜨림 X.
+  - 패턴: `MemorySnapshot.render()` 의 conditional append 가 v0.3 prompt byte-identical
+    보존을 보장 (global_patterns 비어있으면 섹션 자체 안 적음).
+  - 주의사항: `~/.agent-loop/global/` 의 동시 race 는 `O_APPEND` write + dedup-on-read 로
+    완화 (최악의 경우 라인 1 개 중복). flock 은 v0.5 검토.
+  - 주의사항: typer subcommand 그룹 (Typer instance) 은 `app.add_typer(memory_app,
+    name="memory")` 으로 등록. 안 그러면 `--help` 에 안 보임.
 ---
 
 ## [2026-04-27 18:30] - v0.3.1 cli_timeout per-phase + judge_always_llm

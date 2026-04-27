@@ -7,14 +7,22 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
-**v0.3-dev** — multi-judge consensus engine (worker-B) and multi-strategy plan
-fan-out (worker-C) both landed. `JudgeEngine` runs N parallel judges with
-weighted-majority aggregation; `StrategyEngine` runs N parallel plans through
-a heuristic+LLM Selector and writes the winner to `plan.md`. CLI surfaces both
-via `--judge` / `--strategy` (each repeatable) plus `AGENT_LOOP_RUNTIME_JUDGES`
-/ `AGENT_LOOP_RUNTIME_STRATEGIES` env vars. 117 unit tests passing (77 from
-v0.2.1 + 21 multi-judge + 19 multi-strategy). Live cross-vendor validation
-queued for v0.3.0 release. Earlier milestones:
+**v0.4.0** — cross-task global memory. ContextEngine now snapshots a slice of
+`~/.agent-loop/global/patterns.md` and the orchestrator commits this task's
+`CORE:` lines + a one-line summary at run end. Two tasks under the same user
+share patterns automatically; `agent-loop memory {show,list,wipe,path}` manages
+the dir. Privacy: only `CORE:` lines and `task_md_first_line` ever leave the
+task dir — code, prompts, and full task text stay local. `--no-cross-task`
+disables for a single run; `runtime.cross_task_memory = false` disables
+permanently. 151 unit tests passing (132 v0.3.2 + 19 cross-task). MCP server
+exposing the global dir is queued for v0.4.1.
+
+- **v0.3-dev** — multi-judge consensus engine (worker-B) and multi-strategy plan
+  fan-out (worker-C) both landed. `JudgeEngine` runs N parallel judges with
+  weighted-majority aggregation; `StrategyEngine` runs N parallel plans through
+  a heuristic+LLM Selector and writes the winner to `plan.md`. CLI surfaces both
+  via `--judge` / `--strategy` (each repeatable) plus `AGENT_LOOP_RUNTIME_JUDGES`
+  / `AGENT_LOOP_RUNTIME_STRATEGIES` env vars.
 
 - **v0.2.1** — three CLI providers (`cursor-agent`, Claude Code `claude`, Google `gemini`) plus
   litellm in one model dispatch table, 77 unit tests passing, and a cross-vendor live
@@ -664,6 +672,76 @@ If only one strategy is configured the selector is skipped entirely (`selector_m
   `claude/default`, expect the rubric to add ~10 s on top of the parallel critical path.
 - `selector_method == "fallback"` is captured on the plan metric row in
   `metrics.jsonl` so observers can detect rubric outages.
+
+## Cross-task memory (v0.4)
+
+Each task directory keeps its own `memory/core_facts.md` (3-tier Context Engine,
+v0.2). v0.4 promotes any line that starts with `CORE:` up into a per-user global
+directory at `~/.agent-loop/global/`, so future tasks see prior learning:
+
+```
+~/.agent-loop/global/
+├── patterns.md         # CORE: lines from all tasks (deduplicated)
+└── task_index.jsonl    # one row per completed task (audit trail)
+```
+
+The orchestrator calls `ContextEngine.commit_to_global(...)` at the end of every
+run (`stop` / `max_redo` / `max_cycles` / `budget_exceeded` — every exit path),
+appending only:
+
+- new `CORE:` lines from this task's `core_facts.md` (exact-match dedup against
+  the existing `patterns.md`)
+- one row in `task_index.jsonl`: `{task_id, weighted_score, cycles, final_status,
+  task_md_first_line, timestamp}`
+
+`MemorySnapshot.render()` adds a `# Global Patterns (cross-task)` section to
+the `{memory}` slot of every phase prompt when the file is non-empty.
+
+### Privacy
+
+- Only `CORE:` lines (which you opt into via judge hints) and the **first line**
+  of `task.md` ever leave the task directory.
+- Code (`solution.py`), `plan.md`, full task descriptions, and LLM responses are
+  never copied to the global dir.
+- `agent-loop memory wipe` deletes the entire global dir after confirmation.
+- Single-host only (no cloud sync). `runtime.cross_task_memory = false` reverts
+  to v0.3 single-task behaviour.
+
+### CLI
+
+```bash
+agent-loop memory path                    # print ~/.agent-loop/global/
+agent-loop memory show --limit 50         # print last 50 patterns
+agent-loop memory list                    # rich table of past tasks
+agent-loop memory wipe [--yes]            # delete the dir (confirms unless --yes)
+
+agent-loop run "..." --no-cross-task      # disable for this run only
+```
+
+### Config
+
+```toml
+[runtime]
+cross_task_memory               = true              # default ON
+cross_task_memory_dir           = "~/.agent-loop/global"
+cross_task_memory_max_chars     = 4000              # snapshot slice budget
+```
+
+Environment overrides:
+
+- `AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY=false`
+- `AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_DIR=/path/to/dir`
+- `AGENT_LOOP_RUNTIME_CROSS_TASK_MEMORY_MAX_CHARS=8000`
+
+### Caveats
+
+- Recommended ceiling: ~50 KB in `patterns.md` before signal-to-noise drops.
+  `cross_task_memory_max_chars` (default 4000) caps how much enters the prompt
+  on each phase; trailing slice (most recent commits win).
+- Concurrent runs share the same `patterns.md` — append-only `O_APPEND` writes
+  + dedup-on-read make worst-case race a duplicate line, never corruption.
+- `commit_to_global` is **idempotent** for the same `task_id`; `agent-loop resume`
+  does not double-count.
 
 ## Configuration
 
