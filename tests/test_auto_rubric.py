@@ -55,7 +55,10 @@ def test_generate_rubric_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     _patch_llm(monkeypatch, json.dumps(payload))
 
-    out = auto_rubric.generate_rubric("Implement gcd(a,b)", "(no findings)", Config())
+    gen = auto_rubric.generate_rubric("Implement gcd(a,b)", "(no findings)", Config())
+    # v0.4.2: returns a RubricGeneration bundle, not a bare dict.
+    assert isinstance(gen, auto_rubric.RubricGeneration)
+    out = gen.rubric
     assert isinstance(out, dict)
     axes = out["axes"]
     assert set(axes.keys()) == {"correctness", "edge_cases"}
@@ -85,10 +88,43 @@ def test_generate_rubric_fenced_block(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     text = "Here's the rubric:\n```json\n" + json.dumps(payload) + "\n```\nDone."
     _patch_llm(monkeypatch, text)
-    out = auto_rubric.generate_rubric("t", "f", Config())
+    gen = auto_rubric.generate_rubric("t", "f", Config())
+    out = gen.rubric
     # weights normalised to 0.5 each (1.0 / 2.0)
     assert out["axes"]["a1"]["weight"] == pytest.approx(0.5)
     assert out["axes"]["a2"]["weight"] == pytest.approx(0.5)
+
+
+# ---------- v0.4.2: ModelResponse preserved on RubricGeneration ----------
+
+def test_generate_rubric_returns_model_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.4.2: response (cost/tokens/latency) is exposed via RubricGeneration."""
+    payload = {
+        "axes": {
+            "correctness": {"weight": 1.0, "evaluator": "llm_rubric", "criterion": "c1"},
+            "robustness": {"weight": 1.0, "evaluator": "llm_rubric", "criterion": "c2"},
+        }
+    }
+    # Wire the mock LLM and override completion_cost to a known nonzero value
+    # so we can verify it survived the pipeline rather than getting dropped.
+    monkeypatch.setattr(
+        models_mod.litellm,
+        "completion",
+        lambda **kw: _fake_completion(json.dumps(payload)),
+    )
+    monkeypatch.setattr(models_mod.litellm, "completion_cost", lambda **_: 0.0042)
+
+    gen = auto_rubric.generate_rubric("task body", "findings body", Config())
+    resp = gen.response
+    # ModelResponse has the canonical fields and they are populated.
+    assert hasattr(resp, "cost_usd")
+    assert hasattr(resp, "latency_s")
+    assert hasattr(resp, "prompt_tokens")
+    assert hasattr(resp, "completion_tokens")
+    assert resp.prompt_tokens == 10  # _fake_completion fixture
+    assert resp.completion_tokens == 20
+    assert resp.cost_usd == pytest.approx(0.0042)
+    assert resp.latency_s >= 0.0  # nonzero clock — at least it was measured
 
 
 # ---------- _validate_and_normalize ----------

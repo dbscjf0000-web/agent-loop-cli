@@ -104,7 +104,69 @@
   `Runtime.auto_rubric: bool = True` (default ON). ENV `AGENT_LOOP_RUNTIME_AUTO_RUBRIC=
   false`. CLI `--no-auto-rubric` (run only — bench 는 yaml 우선이라 무관).
 - auto-rubric 은 R 후 별도 call_model — 우선순위 `rubric.json > rubric_auto.json > legacy`.
+- v0.4.2 privacy fix: `workers._memory_text(task_dir, config)` 시그니처 — config 로
+  `runtime.cross_task_memory*` 를 `ContextEngine` 에 전달해야 worker prompt 가
+  `--no-cross-task` 플래그를 honor 함. 5개 phase worker (R/P/I/V/J) 호출처 모두 갱신.
+  (이전엔 `ContextEngine(task_dir)` default 로 만들어서 config 가 무시됨.)
+- v0.4.2 metric fix: `auto_rubric.generate_rubric` → `RubricGeneration(rubric, response)`
+  반환. `_maybe_generate_auto_rubric` 가 `task_dir.append_metric({"phase":"_auto_rubric",
+  ...cost_usd/tokens_in/tokens_out/latency_s})` 한 row 추가 + `run_research` 가 ModelResponse
+  의 cost/latency/tokens 합산해서 반환 → 오케스트레이터 budget guard 가 auto-rubric 비용
+  포함. underscore prefix(`_auto_rubric`) 는 orchestrator hardcode phase set 회피
+  (v0.2 `_cycle_quality` 와 동일 패턴).
 
+---
+
+## [2026-04-27 23:55] - v0.4.2 fixups (privacy + metric)
+- 구현:
+  - Privacy bug (#1) fix: `workers._memory_text` 시그니처를 `(task_dir, config)` 로
+    바꾸고 `ContextEngine(td, global_root=cfg.runtime.cross_task_memory_dir,
+    cross_task=cfg.runtime.cross_task_memory, global_max_chars=...)` 로 만들어
+    `--no-cross-task` / `runtime.cross_task_memory=False` 가 phase prompt 에서도
+    honored 되도록 수정. 5개 phase worker (R/P/I/V/J + multi-strategy/multi-judge)
+    호출처 모두 `_memory_text(task_dir, config)` 로 갱신.
+  - Metric bug (#2) fix: `auto_rubric.generate_rubric` 의 반환을
+    `RubricGeneration(rubric, response)` dataclass 로 변경 (ModelResponse 보존).
+    `workers._maybe_generate_auto_rubric` 가 `task_dir.append_metric({"phase":
+    "_auto_rubric", "model", "tokens_in/out", "cost_usd", "latency_s",
+    "n_axes"})` row 작성. `run_research` 는 main resp + auto-rubric resp 의
+    cost/latency/tokens 합산한 새 ModelResponse 반환 → orchestrator
+    `total_cost += resp.cost_usd` 가 auto-rubric 비용까지 budget guard 에 포함.
+  - 단위 테스트 추가:
+    - `test_cross_task.py`: `_memory_text` 가 cross_task=False 면 "Global Patterns"
+      섹션 부재, True 면 존재 (priv1 task fixture).
+    - `test_auto_rubric.py`: `RubricGeneration` 반환 + `gen.response.cost_usd/
+      tokens/latency` 모두 nonzero 검증 + 기존 happy-path/fenced-block 테스트
+      `gen.rubric` 으로 갱신.
+    - `test_workers_autorubric.py`: `run_research` 후 `metrics.jsonl` 에
+      `phase=_auto_rubric` row + cost/tokens/latency 채워짐 확인. 별도로
+      반환된 ModelResponse 에 두 호출 토큰 합산되는지도 검증.
+- 변경 파일:
+  - `src/agent_loop/workers.py` (~30 라인 변경: _memory_text 시그니처 + 5개
+    호출처 + _maybe_generate_auto_rubric 가 ModelResponse 반환 + run_research
+    가 cost 합산).
+  - `src/agent_loop/auto_rubric.py` (~20 라인 변경: RubricGeneration dataclass
+    + 반환 타입).
+  - `src/agent_loop/__init__.py` (`0.4.1` → `0.4.2`).
+  - `tests/test_cross_task.py` (privacy fix 테스트 1개 추가).
+  - `tests/test_auto_rubric.py` (1개 추가, 2개 갱신).
+  - `tests/test_workers_autorubric.py` (2개 추가).
+  - `README.md` (Auto-rubric / Cross-task memory 섹션에 v0.4.2 한 줄씩).
+  - `docs/architecture.md` (Auto-rubric 표 행에 v0.4.2 footnote).
+  - `progress.txt` (Codebase Patterns 2 줄 + 본 엔트리).
+- 상태: 완료 (172 passed)
+- 다음 할 일:
+  - v0.5 MCP server 시작.
+  - v1.0+ 후보: global memory append race (fcntl.flock).
+- 학습:
+  - 패턴: ContextEngine 은 leaf 라서 stateless — 매 호출 때마다 config 받아 새로
+    만들어야 함. workers 내부에 만들 때 부주의하면 default 가 사용됨 (이번 버그).
+  - 패턴: 단발 LLM 호출이 ModelResponse 를 버리면 telemetry/budget 모두 누락 →
+    부산물 phase 도 별도 metric row 작성 + 반환 cost 합산이 필요. underscore
+    prefix(`_auto_rubric`/`_cycle_quality`) 는 orchestrator hardcode 회피 패턴.
+  - 주의사항: orchestrator 의 `total_cost` 누적은 `resp.cost_usd` 만 본다 →
+    부산물 cost 는 R worker 가 합산해서 반환해야 함 (별도 metric row 만으로는
+    budget 검사에 미치지 않음).
 ---
 
 ## [2026-04-27 22:00] - v0.4.0 cross-task memory

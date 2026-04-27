@@ -18,22 +18,40 @@ Design contract:
   to fall back to the legacy verifier (``workers.run_research`` does).
 
 Public surface:
-    generate_rubric(task_text, findings_text, config) -> dict[str, Any]
+    generate_rubric(task_text, findings_text, config) -> RubricGeneration
     RUBRIC_SCHEMA_PROMPT: str
 
-The returned dict is the same shape that :py:class:`agent_loop.verify_engine.
-VerifyEngine.evaluate` expects, so downstream code is unchanged.
+v0.4.2: ``generate_rubric`` now returns a :class:`RubricGeneration` so the
+caller can persist the underlying ``ModelResponse`` (cost / tokens / latency)
+into ``metrics.jsonl`` instead of dropping it on the floor. The rubric dict
+is still the same shape that :py:class:`agent_loop.verify_engine.VerifyEngine.
+evaluate` expects, so downstream code is unchanged.
 """
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from agent_loop.config import Config
-from agent_loop.models import call_model
+from agent_loop.models import ModelResponse, call_model
 
-__all__ = ["generate_rubric", "RUBRIC_SCHEMA_PROMPT"]
+__all__ = ["generate_rubric", "RubricGeneration", "RUBRIC_SCHEMA_PROMPT"]
+
+
+@dataclass
+class RubricGeneration:
+    """Bundle the validated rubric with the underlying ``ModelResponse``.
+
+    Returned by :func:`generate_rubric` so callers can record the LLM call's
+    cost / tokens / latency into telemetry. The ``rubric`` field has the
+    same shape :py:class:`agent_loop.verify_engine.VerifyEngine.evaluate`
+    expects.
+    """
+
+    rubric: dict[str, Any]
+    response: ModelResponse
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +205,13 @@ def generate_rubric(
     task_text: str,
     findings_text: str,
     config: Config,
-) -> dict[str, Any]:
+) -> RubricGeneration:
     """Ask the LLM (research-phase model) to propose a multi-axis rubric.
 
-    Returns the validated + normalised rubric ready to drop into
-    ``artifacts/rubric_auto.json``.
+    Returns a :class:`RubricGeneration` bundling the validated + normalised
+    rubric and the underlying ``ModelResponse`` so callers can record the
+    LLM call's telemetry (cost / tokens / latency) — v0.4.2 fix for the
+    metric-dropping bug.
 
     Raises ``RuntimeError`` on any LLM / parsing / validation failure so the
     caller can warn-and-fallback gracefully.
@@ -211,4 +231,4 @@ def generate_rubric(
     )
     rubric = _extract_json(resp.text)
     _validate_and_normalize(rubric)
-    return rubric
+    return RubricGeneration(rubric=rubric, response=resp)

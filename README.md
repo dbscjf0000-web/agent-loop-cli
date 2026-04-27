@@ -675,6 +675,9 @@ If only one strategy is configured the selector is skipped entirely (`selector_m
 
 ## Cross-task memory (v0.4)
 
+> v0.4.2 fix: `--no-cross-task` is now honored inside phase prompts as well
+> (previously workers built a default `ContextEngine` that ignored the flag).
+
 Each task directory keeps its own `memory/core_facts.md` (3-tier Context Engine,
 v0.2). v0.4 promotes any line that starts with `CORE:` up into a per-user global
 directory at `~/.agent-loop/global/`, so future tasks see prior learning:
@@ -744,6 +747,10 @@ Environment overrides:
   does not double-count.
 
 ## Auto-rubric (v0.4.1)
+
+> v0.4.2: cost / tokens / latency for the auto-rubric LLM call are now tracked
+> as a dedicated `phase=_auto_rubric` row in `telemetry/metrics.jsonl` (and
+> rolled into the per-run budget), instead of being silently dropped.
 
 `agent-loop run "<task>"` (free-form prose, no benchmark YAML) used to fall
 back to a single-shot LLM verifier — one axis, one number, one paragraph of

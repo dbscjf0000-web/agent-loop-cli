@@ -168,6 +168,11 @@ makes sense (KISS / YAGNI; see `progress.txt`). Future work has known extraction
         |                                    (code-aware pytest/benchmark axis generation is
         |                                    a v0.4.2 candidate). Default ON; flag
         |                                    `--no-auto-rubric` for one-shot opt-out.
+        |                                    v0.4.2: returns RubricGeneration (rubric, response)
+        |                                    so workers append a `phase=_auto_rubric` row to
+        |                                    telemetry/metrics.jsonl (cost/tokens/latency) and
+        |                                    fold cost into run_research's ModelResponse for the
+        |                                    per-run budget guard.
         |                                    src/agent_loop/auto_rubric.py
         |
         +-- (v0.3) LLM Compactor      -- swap rule-based body of context.compact()

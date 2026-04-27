@@ -125,14 +125,24 @@ def _workspace_listing(task_dir: TaskDir) -> str:
     return "\n".join(lines) if lines else "(empty)"
 
 
-def _memory_text(task_dir: TaskDir) -> str:
+def _memory_text(task_dir: TaskDir, config: Config) -> str:
     """Render the v0.2 ContextEngine snapshot as the ``{memory}`` prompt slot.
 
     Falls back to the legacy ``memory.txt`` content when the engine has no data
     yet (very first phase of a fresh task) so the prompt never sees a blank
     string when something useful is available.
+
+    v0.4.2: ``config`` is now required so cross-task settings (``--no-cross-task``
+    / ``runtime.cross_task_memory*``) are honored inside phase workers. Earlier
+    versions silently constructed a default ``ContextEngine(task_dir)`` here,
+    which made workers ignore the user's privacy flag.
     """
-    eng = ContextEngine(task_dir)
+    eng = ContextEngine(
+        task_dir,
+        global_root=config.runtime.cross_task_memory_dir,
+        cross_task=config.runtime.cross_task_memory,
+        global_max_chars=config.runtime.cross_task_memory_max_chars,
+    )
     eng.init()
     snap = eng.snapshot()
     rendered = snap.render()
@@ -201,7 +211,7 @@ def _current_cycle(task_dir: TaskDir) -> int:
 
 def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir)
+    memory = _memory_text(task_dir, config)
     prompt = _load_prompt("research").format(task=task, memory=memory)
     resp = call_model(
         "research",
@@ -223,7 +233,20 @@ def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     # the same multi-axis verify experience as bench (yaml-driven). Skipped
     # when (a) auto_rubric is disabled, (b) a hand-written rubric already
     # exists, or (c) a previous cycle already wrote rubric_auto.json.
-    _maybe_generate_auto_rubric(task_dir, config, task, resp.text)
+    # v0.4.2: any auto-rubric cost / latency is folded into the returned
+    # research ModelResponse so the orchestrator's total_cost (and budget
+    # guard) includes it. A dedicated `_auto_rubric` row in metrics.jsonl
+    # preserves audit granularity.
+    extra = _maybe_generate_auto_rubric(task_dir, config, task, resp.text)
+    if extra is not None:
+        resp = ModelResponse(
+            text=resp.text,
+            prompt_tokens=resp.prompt_tokens + extra.prompt_tokens,
+            completion_tokens=resp.completion_tokens + extra.completion_tokens,
+            cost_usd=round(resp.cost_usd + extra.cost_usd, 6),
+            latency_s=round(resp.latency_s + extra.latency_s, 4),
+            model=resp.model,
+        )
     return resp
 
 
@@ -232,27 +255,38 @@ def _maybe_generate_auto_rubric(
     config: Config,
     task_text: str,
     findings_text: str,
-) -> None:
+) -> ModelResponse | None:
     """Best-effort auto-rubric generation. Errors are isolated — never raise.
 
     Writes ``artifacts/rubric_auto.json`` on success. Logs a one-line
     summary to ``memory/history.jsonl`` so the audit trail captures the
-    extra LLM call. Skips when:
+    extra LLM call. v0.4.2: also appends a ``phase=_auto_rubric`` row to
+    ``telemetry/metrics.jsonl`` so the underlying LLM call's cost / tokens
+    / latency are tracked (previously dropped on the floor). The leading
+    underscore mirrors ``_cycle_quality`` and avoids the orchestrator's
+    hardcoded phase set.
+
+    Returns the underlying ``ModelResponse`` so ``run_research`` can fold the
+    cost / latency back into the response it returns to the orchestrator
+    (otherwise auto-rubric cost would slip past the per-run budget guard).
+    Returns ``None`` when generation was skipped or failed.
+
+    Skips when:
       - ``runtime.auto_rubric`` is False,
       - ``artifacts/rubric.json`` already exists (hand-written / yaml),
       - ``artifacts/rubric_auto.json`` already exists (resume / re-research).
     """
     if not getattr(config.runtime, "auto_rubric", True):
-        return
+        return None
     if task_dir.has_artifact("rubric.json"):
-        return
+        return None
     if task_dir.has_artifact("rubric_auto.json"):
-        return
+        return None
 
     try:
         from agent_loop.auto_rubric import generate_rubric
 
-        rubric = generate_rubric(task_text, findings_text, config)
+        gen = generate_rubric(task_text, findings_text, config)
     except Exception as e:  # pragma: no cover - defensive
         ContextEngine(task_dir).append_history(
             {
@@ -263,13 +297,31 @@ def _maybe_generate_auto_rubric(
                 "auto_rubric": False,
             }
         )
-        return
+        return None
 
+    rubric = gen.rubric
+    resp = gen.response
     task_dir.write_artifact("rubric_auto.json", rubric)
     axes = list((rubric.get("axes") or {}).keys())
+    cycle = _current_cycle(task_dir)
+    # v0.4.2: dedicated metric row so cost/latency/tokens are not lost. The
+    # `_auto_rubric` phase prefix sidesteps the orchestrator's hardcoded
+    # phase set (matches the existing `_cycle_quality` convention).
+    task_dir.append_metric(
+        {
+            "cycle": cycle,
+            "phase": "_auto_rubric",
+            "model": resp.model,
+            "tokens_in": resp.prompt_tokens,
+            "tokens_out": resp.completion_tokens,
+            "cost_usd": resp.cost_usd,
+            "latency_s": resp.latency_s,
+            "n_axes": len(axes),
+        }
+    )
     ContextEngine(task_dir).append_history(
         {
-            "cycle": _current_cycle(task_dir),
+            "cycle": cycle,
             "phase": "research",
             "summary": f"auto_rubric: {len(axes)} axes -> {','.join(axes)}",
             "model": "(auto_rubric)",
@@ -277,6 +329,7 @@ def _maybe_generate_auto_rubric(
             "n_axes": len(axes),
         }
     )
+    return resp
 
 
 def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
@@ -298,7 +351,7 @@ def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
 def _run_plan_single(task_dir: TaskDir, config: Config) -> ModelResponse:
     """v0.1 / v0.2 body: single LLM plan call. Preserved verbatim for backward compat."""
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir)
+    memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
     prompt = _load_prompt("plan").format(
         task=task, memory=memory, findings=findings
@@ -343,7 +396,7 @@ def _run_plan_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     )
 
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir)
+    memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
     prompt = _load_prompt("plan").format(
         task=task, memory=memory, findings=findings
@@ -609,7 +662,7 @@ def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
         )
 
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir)
+    memory = _memory_text(task_dir, config)
     sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
     # judge_always_llm + first cycle: no prior best yet. Pass an empty stub so
     # the prompt is still well-formed and the LLM is genuinely invoked.
@@ -690,7 +743,7 @@ def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     )
 
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir)
+    memory = _memory_text(task_dir, config)
     sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
     # First cycle + judge_always_llm: best_solution.json may not exist yet.
     best_obj = (

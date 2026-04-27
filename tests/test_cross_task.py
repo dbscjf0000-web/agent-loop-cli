@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from agent_loop.config import Config
 from agent_loop.context import ContextEngine, MemorySnapshot
 from agent_loop.state import TaskDir
+from agent_loop.workers import _memory_text
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +260,41 @@ def test_snapshot_no_global_file(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 11. backward compat — ContextEngine() with no kwargs still works (default cross_task=True)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 12. v0.4.2: workers._memory_text honours --no-cross-task / config flag
+# ---------------------------------------------------------------------------
+
+def test_memory_text_omits_global_when_cross_task_off(tmp_path: Path) -> None:
+    """v0.4.2 fix: workers._memory_text must respect Config.runtime.cross_task_memory.
+
+    Pre-fix, _memory_text built ContextEngine(task_dir) with no kwargs, so the
+    user's privacy flag was silently ignored inside phase prompts even though
+    the orchestrator honored it for global commits.
+    """
+    td = TaskDir(root=tmp_path / "tasks", task_id="priv1")
+    td.init()
+    gdir = tmp_path / "global"
+    gdir.mkdir(parents=True, exist_ok=True)
+    (gdir / "patterns.md").write_text(
+        "CORE: secret pattern from another task\n", encoding="utf-8"
+    )
+
+    cfg = Config()
+    cfg.runtime.cross_task_memory_dir = str(gdir)
+
+    # cross_task=True (default): the global slice IS rendered.
+    cfg.runtime.cross_task_memory = True
+    on_text = _memory_text(td, cfg)
+    assert "Global Patterns" in on_text
+    assert "CORE: secret pattern from another task" in on_text
+
+    # cross_task=False: the global slice MUST NOT leak into the prompt.
+    cfg.runtime.cross_task_memory = False
+    off_text = _memory_text(td, cfg)
+    assert "Global Patterns" not in off_text
+    assert "CORE: secret pattern from another task" not in off_text
+
 
 def test_default_constructor_is_backward_compatible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Calling ContextEngine(td) with no kwargs must still work — uses default global root.

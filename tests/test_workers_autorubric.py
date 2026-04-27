@@ -89,6 +89,53 @@ def test_run_research_writes_rubric_auto_when_enabled(
     assert set(rubric["axes"].keys()) == {"correctness", "edge_cases"}
 
 
+# ---------- v0.4.2: auto-rubric metric row ----------
+
+def test_run_research_appends_auto_rubric_metric_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.4.2: auto-rubric writes a `_auto_rubric` row to telemetry/metrics.jsonl."""
+    td = _seed(tmp_path, tid="wa_metric")
+    _scripted_completion(monkeypatch, ["# Findings\n- gcd is well-known", _VALID_RUBRIC_JSON])
+
+    workers.run_research(td, Config())
+
+    # metrics.jsonl must exist with a _auto_rubric row.
+    metrics_path = td.path / "telemetry" / "metrics.jsonl"
+    assert metrics_path.exists(), "telemetry/metrics.jsonl missing"
+    rows = [
+        json.loads(ln)
+        for ln in metrics_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    auto_rows = [r for r in rows if r.get("phase") == "_auto_rubric"]
+    assert len(auto_rows) == 1
+    row = auto_rows[0]
+    # Cost/tokens/latency are populated (no longer dropped on the floor).
+    assert "cost_usd" in row
+    assert "tokens_in" in row and row["tokens_in"] > 0
+    assert "tokens_out" in row and row["tokens_out"] > 0
+    assert "latency_s" in row
+    assert row.get("n_axes") == 2
+
+
+def test_run_research_returned_response_includes_auto_rubric_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.4.2: returned ModelResponse rolls in auto-rubric tokens so the
+    orchestrator's per-run budget guard sees the auto-rubric cost.
+    """
+    td = _seed(tmp_path, tid="wa_budget")
+    _scripted_completion(monkeypatch, ["# Findings line", _VALID_RUBRIC_JSON])
+
+    resp = workers.run_research(td, Config())
+    # Each fake call yields prompt_tokens=5, completion_tokens=5 in
+    # _scripted_completion -> _fake_completion. Two calls means tokens
+    # are at least double the single-call baseline.
+    assert resp.prompt_tokens >= 10
+    assert resp.completion_tokens >= 10
+
+
 def test_run_research_skips_auto_rubric_when_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
