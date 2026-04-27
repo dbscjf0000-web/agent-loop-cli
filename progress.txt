@@ -114,6 +114,78 @@
   의 cost/latency/tokens 합산해서 반환 → 오케스트레이터 budget guard 가 auto-rubric 비용
   포함. underscore prefix(`_auto_rubric`) 는 orchestrator hardcode phase set 회피
   (v0.2 `_cycle_quality` 와 동일 패턴).
+- v0.5.0 MCP server: `src/agent_loop/mcp/` (server.py / handlers.py / protocol.py /
+  __init__.py) 신규. JSON-RPC 2.0 over stdio (HTTP 는 v0.5.x 후보), 의존성 0 (stdlib
+  only — `mcp` SDK 도입 X). 6 tools (`agent_loop.{run,list,status,resume,bench,
+  memory_show}`) + 4 resources (`agent-loop://task/{id}/{solution,memory,metrics}`,
+  `agent-loop://global/patterns`). Privacy: `cross_task_memory=False` 면 global
+  resource 는 `ERR_PRIVACY_DISABLED (-32000)` 반환, 다른 task 의 task.md / prompt 는
+  resource URI scheme 자체에 없음. server 는 long-running 이지만 매 tool call 마다
+  `Orchestrator(td, cfg)` 새로 만듦 (stateless 보존). CLI: `agent-loop mcp serve` /
+  `agent-loop mcp tools` / `agent-loop mcp resources`. handler 분기: `Handlers.dispatch
+  (method, params, rid) -> Response` 가 `_PrivacyError`/`_NotFoundError`/`_BadParams
+  Error`/일반 Exception 모두 잡아 JSON-RPC error 로 wrap (server loop 절대 안 죽음).
+
+---
+
+## [2026-04-27 24:30] - v0.5.0 MCP server (stdio)
+- 구현:
+  - 신규 모듈 `src/agent_loop/mcp/`:
+    - `__init__.py` (~21 lines): PROTOCOL_VERSION="2024-11-05", SERVER_NAME, SERVER_VERSION 상수.
+    - `protocol.py` (~129 lines): JSON-RPC 2.0 dataclass (`Request`/`Response`),
+      `parse_request`/`serialize_response`/`make_error` 헬퍼, error code 상수
+      (`ERR_PARSE`=-32700, `ERR_INVALID_REQUEST`=-32600, `ERR_METHOD_NOT_FOUND`=-32601,
+      `ERR_INVALID_PARAMS`=-32602, `ERR_INTERNAL`=-32603, custom: `ERR_PRIVACY_DISABLED`
+      =-32000, `ERR_NOT_FOUND`=-32001, `ERR_TOOL_FAILED`=-32002).
+    - `handlers.py` (~362 lines): `Handlers(config, root)` 디스패처. `TOOL_SPECS` (6),
+      `RESOURCE_SPECS` (4) catalog. 6 tool 구현 (`_tool_run`/`_tool_list`/`_tool_status`/
+      `_tool_resume`/`_tool_bench`/`_tool_memory_show`), 4 resource 구현
+      (`task/{id}/solution`, `task/{id}/memory`, `task/{id}/metrics`, `global/patterns`).
+      모두 try/except 로 격리, JSON-RPC error 로 wrap.
+    - `server.py` (~95 lines): `serve_stdio(config, root, *, stdin, stdout)` — 한 줄
+      한 JSON-RPC 메시지 루프. EOF (stdin 닫힘) 시 정상 종료. `id is None`(notification)
+      이면 응답 안 보냄.
+  - `src/agent_loop/cli.py` 확장: `mcp_app` (typer.Typer) + 3 commands (`serve`/
+    `tools`/`resources`). `mcp serve --transport http` 는 exit 2 (v0.5.x 후보).
+  - `src/agent_loop/__init__.py`: `__version__ = "0.5.0"`.
+- 변경 파일:
+  - 신규: `src/agent_loop/mcp/{__init__,protocol,handlers,server}.py`,
+    `tests/test_mcp_protocol.py` (7 tests), `tests/test_mcp_handlers.py` (11 tests),
+    `tests/test_mcp_cli.py` (5 tests), `docs/plan-v0.5.md` (~210 lines).
+  - 수정: `src/agent_loop/cli.py` (mcp_app + 3 commands, ~70 lines 추가),
+    `src/agent_loop/__init__.py`, `README.md` (Status v0.5.0 + 새 "MCP server (v0.5)"
+    섹션), `docs/architecture.md` (v0.5.0-dev 헤더, MCP server 박스, mcp/ 모듈 행).
+- 상태: 완료 (mock 검증, push 미진행).
+- 검증:
+  - pytest: 195 passed (172 baseline + 23 신규: protocol 7 + handlers 11 + cli 5).
+  - mock e2e: stdin 에 4 줄 (initialize / tools/list / tools/call agent_loop.list /
+    resources/list) 주입 → stdout 으로 정확한 4 응답 (id 1~4, 모두 result 키 채워짐).
+- 학습:
+  - 패턴: MCP 표준 = JSON-RPC 2.0 over stdio. `mcp` SDK 안 깔아도 stdlib `json` +
+    stdin/stdout 으로 50~100 줄에 구현 가능. 향후 prompts/sampling 등 복잡 기능
+    필요 시 v0.6+ 에 SDK 도입 검토.
+  - 패턴: `Handlers.dispatch(method, params, rid)` 단일 entry point — server loop
+    은 dumb (parse → dispatch → write 만). 새 method 추가 = handlers.py 안에서만.
+  - 패턴: tool 내부 예외 4 분류 (`_PrivacyError`/`_NotFoundError`/`_BadParamsError`/
+    일반 Exception) → 적절한 JSON-RPC error code 매핑 (-32000/-32001/-32602/-32002).
+    server loop 은 절대 죽지 않음.
+  - 패턴: resources URI scheme 이 privacy boundary — `agent-loop://task/{id}/...`
+    = 해당 task scope, `agent-loop://global/patterns` = `cross_task_memory=True`
+    필수. 다른 task 의 task.md / prompt 는 URI 자체에 없어서 enumeration 공격 차단.
+  - 주의사항: `agent_loop.run` 은 sync (blocking) — client (Claude Code 등) timeout
+    이 길어야 함. v0.5.x 에 async + status polling 검토.
+  - 주의사항: server 는 single-thread loop — 동시 호출은 sequential 처리. global
+    memory race condition 회피용. 본격 병렬은 v1.0+ (`fcntl.flock`).
+  - 주의사항: Rich Table 이 Console 폭 좁으면 cell 컨텐츠 wrap → 테스트에서
+    `result.stdout` 정확 substring 검사 위험. 근본 데이터(`TOOL_SPECS`/`RESOURCE_
+    SPECS`) 직접 import 해서 테스트하는 게 robust (`test_mcp_cli.py::test_mcp_
+    resources_lists_four`).
+- 다음 할 일:
+  - 부모가 git commit/push 진행 (워커는 commit 금지).
+  - 라이브 검증: Claude Code 나 Cursor 의 `.mcp.json` 에 등록 후 `agent_loop.run`
+    실제 호출, sync timeout 영향 측정.
+  - v0.5.x 후보: HTTP transport (`--transport http --port N`), async run +
+    `agent_loop.status` polling, prompts/* 노출 (`prompts/list` / `prompts/get`).
 
 ---
 

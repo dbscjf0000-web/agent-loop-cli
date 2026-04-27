@@ -7,15 +7,22 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
-**v0.4.0** — cross-task global memory. ContextEngine now snapshots a slice of
-`~/.agent-loop/global/patterns.md` and the orchestrator commits this task's
-`CORE:` lines + a one-line summary at run end. Two tasks under the same user
-share patterns automatically; `agent-loop memory {show,list,wipe,path}` manages
-the dir. Privacy: only `CORE:` lines and `task_md_first_line` ever leave the
-task dir — code, prompts, and full task text stay local. `--no-cross-task`
-disables for a single run; `runtime.cross_task_memory = false` disables
-permanently. 151 unit tests passing (132 v0.3.2 + 19 cross-task). MCP server
-exposing the global dir is queued for v0.4.1.
+**v0.5.0** — Model Context Protocol (MCP) server. Other AI clients (Claude
+Code, Cursor, OpenCode, ...) can now drive `agent-loop` via the standard
+JSON-RPC 2.0 stdio transport — six tools (`agent_loop.run` / `.list` /
+`.status` / `.resume` / `.bench` / `.memory_show`) and four resources
+(`agent-loop://task/{id}/{solution,memory,metrics}` and
+`agent-loop://global/patterns`). Built on stdlib only (no `mcp` SDK
+dependency). Privacy: cross-task is honored at the resource boundary —
+`global/patterns` is refused when `runtime.cross_task_memory=False`, and
+no other task's `task.md` / prompt is ever exposed. 195 unit tests passing
+(172 v0.4.2 + 23 MCP). HTTP transport reserved for v0.5.x.
+
+- **v0.4.0** — cross-task global memory. ContextEngine now snapshots a slice of
+  `~/.agent-loop/global/patterns.md` and the orchestrator commits this task's
+  `CORE:` lines + a one-line summary at run end. Two tasks under the same user
+  share patterns automatically; `agent-loop memory {show,list,wipe,path}` manages
+  the dir. `--no-cross-task` disables for a single run.
 
 - **v0.3-dev** — multi-judge consensus engine (worker-B) and multi-strategy plan
   fan-out (worker-C) both landed. `JudgeEngine` runs N parallel judges with
@@ -672,6 +679,83 @@ If only one strategy is configured the selector is skipped entirely (`selector_m
   `claude/default`, expect the rubric to add ~10 s on top of the parallel critical path.
 - `selector_method == "fallback"` is captured on the plan metric row in
   `metrics.jsonl` so observers can detect rubric outages.
+
+## MCP server (v0.5)
+
+agent-loop ships a built-in **Model Context Protocol** server so any
+MCP-compatible AI client (Claude Code, Cursor, OpenCode, ...) can drive
+`agent_loop.run` / `agent_loop.list` / `agent_loop.bench` / etc. through
+standard JSON-RPC 2.0 — no API integration code needed. Implementation
+is stdlib-only (no `mcp` SDK dependency), ~500 lines under
+`src/agent_loop/mcp/`.
+
+### Quick start
+
+```bash
+# Inspect what the server exposes (no network calls).
+agent-loop mcp tools         # 6 tool specs
+agent-loop mcp resources     # 4 resource URI patterns
+
+# Start the stdio server (block until stdin closes).
+agent-loop mcp serve --root .agent_loop
+```
+
+### Tools (6)
+
+| name                    | purpose                                            |
+|-------------------------|----------------------------------------------------|
+| `agent_loop.run`        | Drive a fresh task through R->P->I->V->J (sync).   |
+| `agent_loop.list`       | List task directories under a state root.          |
+| `agent_loop.status`     | Latest cycle / phase / score for a task.           |
+| `agent_loop.resume`     | Continue a task from its last checkpoint (sync).   |
+| `agent_loop.bench`      | Run a `benchmarks/<name>.yaml` task.               |
+| `agent_loop.memory_show`| Trailing N lines of cross-task `patterns.md`.      |
+
+### Resources (4)
+
+```
+agent-loop://task/{id}/solution    -> workspace/best_solution.py | solution.py
+agent-loop://task/{id}/memory      -> memory/episodic.md + memory/core_facts.md
+agent-loop://task/{id}/metrics     -> telemetry/metrics.jsonl
+agent-loop://global/patterns       -> ~/.agent-loop/global/patterns.md
+```
+
+### Connecting from Claude Code
+
+Add to your `.mcp.json` (project-local) or `~/.config/claude-code/mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "agent-loop": {
+      "command": "python3",
+      "args": ["-m", "agent_loop.cli", "mcp", "serve"],
+      "env": {}
+    }
+  }
+}
+```
+
+Restart Claude Code; the six tools appear in `/mcp` and Claude can call
+`agent_loop.run` directly.
+
+### Privacy
+
+- `agent-loop://global/patterns` returns `ERR_PRIVACY_DISABLED` (-32000) when
+  `runtime.cross_task_memory=False`.
+- Other tasks' `task.md`, prompts, and credentials are **never** exposed —
+  only the calling client's own task scope and (optionally) the dedup'd
+  global patterns are reachable.
+
+### Caveats / current limits
+
+- **stdio only** in v0.5.0. HTTP transport is reserved for v0.5.x.
+- `agent_loop.run` is **synchronous** — the JSON-RPC reply only comes back
+  when all cycles finish. Set the client's MCP timeout high (Claude Code
+  defaults to no timeout).
+- The server processes one request at a time. Concurrent `agent_loop.run`
+  calls from multiple clients are serialized — race-safe but slow.
+- `mcp serve --transport http` exits with code 2 — use stdio for now.
 
 ## Cross-task memory (v0.4)
 

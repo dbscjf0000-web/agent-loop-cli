@@ -69,6 +69,12 @@ memory_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(memory_app, name="memory")
+mcp_app = typer.Typer(
+    name="mcp",
+    help="(v0.5) Model Context Protocol server interface.",
+    no_args_is_help=True,
+)
+app.add_typer(mcp_app, name="mcp")
 
 console = Console()
 
@@ -887,6 +893,64 @@ def cmd_memory_wipe(
             return
     shutil.rmtree(d)
     console.print(f"[bold green][OK][/bold green] wiped {d}")
+
+
+# ---------------------------------------------------------------------------
+# mcp (v0.5)
+# ---------------------------------------------------------------------------
+@mcp_app.command("serve")
+def cmd_mcp_serve(
+    transport: str = typer.Option(
+        "stdio",
+        "--transport",
+        help="Transport for the MCP server. v0.5.0 only ships stdio; http is reserved.",
+    ),
+    config_path: Optional[Path] = typer.Option(None, "--config"),
+    root: Path = typer.Option(Path("./.agent_loop"), "--root", help="State root directory."),
+) -> None:
+    """Start the MCP server (default stdio).
+
+    Other AI clients (Claude Code, Cursor, OpenCode, ...) can spawn this
+    process and drive `agent_loop.run` / `agent_loop.list` / etc. via
+    standard JSON-RPC 2.0. See README "MCP server (v0.5)" for `.mcp.json`.
+    """
+    if transport != "stdio":
+        console.print(f"[red][X][/red] transport '{transport}' not supported in v0.5.0 (stdio only)")
+        raise typer.Exit(2)
+    cfg = load_config(config_path)
+    from agent_loop.mcp.server import serve_stdio
+
+    rc = serve_stdio(cfg, root)
+    raise typer.Exit(int(rc))
+
+
+@mcp_app.command("tools")
+def cmd_mcp_tools() -> None:
+    """List the MCP tools this server exposes."""
+    from agent_loop.mcp.handlers import TOOL_SPECS
+
+    table = Table(title="agent-loop MCP tools")
+    table.add_column("name", style="magenta")
+    table.add_column("required", style="yellow")
+    table.add_column("description", style="white")
+    for spec in TOOL_SPECS:
+        req = ", ".join((spec.get("inputSchema") or {}).get("required") or []) or "-"
+        table.add_row(spec["name"], req, spec.get("description", ""))
+    console.print(table)
+
+
+@mcp_app.command("resources")
+def cmd_mcp_resources() -> None:
+    """List the MCP resources this server exposes."""
+    from agent_loop.mcp.handlers import RESOURCE_SPECS
+
+    table = Table(title="agent-loop MCP resources")
+    table.add_column("uri", style="magenta")
+    table.add_column("mime", style="yellow")
+    table.add_column("description", style="white")
+    for spec in RESOURCE_SPECS:
+        table.add_row(spec["uri"], spec.get("mimeType", ""), spec.get("description", ""))
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
