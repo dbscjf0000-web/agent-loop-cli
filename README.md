@@ -113,6 +113,71 @@ A live run ends with a Rich table. The example below was executed against the
 +-------------------+--------------------------------------+
 ```
 
+### Live e2e (v0.2) — n_queens with multi-axis Verify Engine
+
+The v0.2 live run targets the hardest reference benchmark with a programmatic
+rubric (no LLM verifier), demonstrating both the Verify Engine and the
+Context Engine end-to-end. All five phases use `cursor/auto`:
+
+```bash
+python3 -m agent_loop.cli bench n_queens \
+    --config /tmp/al_v02_e2e/config.toml \
+    --root /tmp/al_v02_e2e/.agent_loop \
+    --cycles 2 --max-redo 1
+```
+
+Result on KISTI Neuron (`task_id=bench-n_queens-7fc13f`, 1 cycle, `final_status=stop`):
+
+| phase           | latency | model                    |
+|-----------------|---------|--------------------------|
+| research        |  26.84s | cursor/auto              |
+| plan            |  25.12s | cursor/auto              |
+| implement       |  16.09s | cursor/auto              |
+| verify          |   4.40s | (verify_engine: rubric)  |
+| judge           |   0.00s | (skipped: first cycle)   |
+| **total**       | **72.45s** |                       |
+
+`solution.json` (multi-axis schema, both ground-truth):
+
+```jsonc
+{"weighted_score": 1.0,
+ "summary": "correctness=1.00 performance=1.00 -> 1.000",
+ "axes": [
+   {"name": "correctness", "score": 1.0, "weight": 0.5,
+    "evaluator": "pytest", "evidence": "10/10 assertions passed",
+    "is_ground_truth": true,
+    "raw": {"passed": 10, "total": 10, "elapsed_s": 1.26}},
+   {"name": "performance", "score": 1.0, "weight": 0.5,
+    "evaluator": "benchmark",
+    "evidence": "median=1.046s, threshold<=1.500s",
+    "is_ground_truth": true,
+    "raw": {"times_s": [1.043, 1.046, 1.046],
+            "median_s": 1.046, "threshold": 1.5,
+            "measure": "wall_clock_seconds"}}]}
+```
+
+Context Engine layout written by the run:
+
+```
+memory/
+├── history.jsonl   # 5 records (research / plan / implement / verify / judge)
+├── episodic.md     # 5 lines, ★best marker on the verify row
+└── core_facts.md   # empty (no CORE: hints emitted this cycle)
+
+telemetry/metrics.jsonl  # 6 rows: 5 phase + 1 _cycle_quality:
+   {"phase":"_cycle_quality","cycle":1,
+    "quality":{"duplicate_ratio":0.0,"contradiction_count":0,
+               "staleness_age_cycles":0,"relevance_score":0.965},
+    "compact":{"size_before":0,"size_after":285,
+               "lines_kept":5,"core_extracted":0,"triggered":true}}
+```
+
+The `solution.py` cursor-agent produced for n_queens used bitmask backtracking
+with first-row symmetry — `n_queens_count(13)` measured at **1.046 s median**
+(safely under the 1.5 s ground-truth threshold). All ten correctness asserts
+(N=1..13) passed in the same `pytest` evaluator run. Judge auto-stopped on
+the first cycle because there was no prior best to beat.
+
 ## Configuration
 
 Default location: `~/.agent-loop/config.toml`. Override with `./agent-loop.toml` (project-local)

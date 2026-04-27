@@ -1,4 +1,5 @@
 ## Codebase Patterns (최상단 고정)
+- v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
 - 이 프로젝트는 standalone CLI (Python). Claude Code 의존성 없음.
 - 모델 추상화: litellm + cursor-agent CLI (subprocess) 듀얼 provider.
   `cursor` / `cursor/<m>` 모델 id는 `_call_cursor_cli`로 분기, 그 외는 litellm.
@@ -537,4 +538,45 @@
       promote 된 경우 다음 cycle 에서 LLM judge 가 prompt 에서 양쪽을 다 읽음.
       `judge.md` 가 두 schema 모두 처리하도록 prose 가 일반적이라 호환됨 (직접 axes/score 키 lookup
       하지 않고 두 객체를 비교하라는 지시).
+---
+
+## [2026-04-27 14:36] - v0.2 라이브 e2e (cursor-agent, n_queens)
+- 실행: `bench n_queens --cycles 2 --max-redo 1`, 5 phase 모두 cursor/auto.
+  task_id=bench-n_queens-7fc13f, root=/tmp/al_v02_e2e/.agent_loop, 총 72.45s (1 cycle).
+- 결과: weighted_score=**1.000**, cycles_run=1, final_status=stop, judge auto-stop (first cycle).
+- v0.2 검증:
+  - **Verify Engine OK**: solution.json 새 schema 완벽 — `axes`(2개) + `weighted_score=1.0` +
+    `summary` 36자 (cap 200 안), 둘 다 `is_ground_truth=true`. correctness 축 = pytest 10/10
+    asserts pass (1.26s elapsed). performance 축 = benchmark median 1.046s (3 repeats:
+    [1.043, 1.046, 1.046]) under 1.5s threshold → score 1.0. yaml_to_rubric 가 자동 작성한
+    `artifacts/rubric.json` 정상 동작.
+  - **Context Engine OK**: memory/ 3-tier 다 작성. history.jsonl 5 lines (research/plan/implement
+    /verify/judge), episodic.md 5 lines + ★best 마커 verify 행에 부착, core_facts.md 0 byte
+    (이번 cycle CORE: hint 없음 — 정상). metrics.jsonl 6 rows: 5 phase + 1 `_cycle_quality`
+    (quality.relevance_score=0.965, compact.lines_kept=5, triggered=true).
+  - **Judge OK**: judge_result.json schema {`better`, `action`, `reason`, `hint`, `scores`} 모두 존재.
+    `weighted_score` 폴백 잘 동작 (this_cycle=1.0, best=null, delta=null). first-cycle short-circuit
+    덕에 LLM 호출 0회, latency 0.00s.
+- 산출물 경로: /tmp/al_v02_e2e/.agent_loop/bench-n_queens-7fc13f/
+  - artifacts/{solution.json, best_solution.json, judge_result.json, rubric.json, findings.md, plan.md, execution_log.md}
+  - memory/{history.jsonl, episodic.md, core_facts.md}
+  - workspace/{solution.py 1.1KB, best_solution.py}
+  - telemetry/metrics.jsonl 1.1KB
+  - checkpoints/cycle_001_phase_*.json (5개)
+- 한계 / 발견된 버그: 0개. n_queens=hard 알고리즘인데 cursor-agent 가 1 cycle 만에 bitmask
+  backtracking + first-row symmetry 작성하여 단번에 정답 + 성능 통과. 아주 깔끔.
+- README.md "Live e2e (v0.2)" 섹션 추가 (라이브 출력 + solution.json schema + memory/ 트리 + 1.046s 측정값).
+- 학습:
+  - 패턴:
+    - cursor/auto 가 알고리즘 task 에서 단 cycle 1 만에 1.0 점 받는 게 가능하다는 게 데이터로 입증됨.
+      — judge auto-stop @ first cycle 정책이 비용/시간 절약에 효과적.
+    - `_cycle_quality` row 의 `relevance_score=0.965` 는 episodic 이 285 byte 라 거의 만점.
+      장기 run 에서 이 값이 떨어지는 시점이 v0.3 LLM compactor 도입 신호가 될 것.
+    - rubric 분기에서 verify phase 는 LLM 호출 0 + 4.40s 만에 끝남 (대부분이 N=13 측정 3 repeat).
+      legacy LLM verify (40s+) 대비 약 10x 빠름 + ground-truth 보장.
+  - 주의사항:
+    - 1 cycle 만에 stop 되면 multi-cycle 시나리오 (compact 의 dropped lines, judge 의 better
+      비교, redo 흐름) 는 검증 안 됨 — 별도 stress test 가 v0.3 candidate.
+    - cursor-agent 의 cost/token 추정 (char/4) 라서 metrics.jsonl 의 tokens 값 (493/438 등)
+      은 참고용. 실제 비용 정밀 추적 불가능 — Pro subscription 가정.
 ---
