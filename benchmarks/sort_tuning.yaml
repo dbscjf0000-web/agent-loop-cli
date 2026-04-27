@@ -1,0 +1,35 @@
+name: sort-tuning
+category: algorithm
+description: |
+  Implement a stable sorting function that beats `sorted()` for a specific
+  semi-sorted input pattern (mostly sorted with a few out-of-place elements).
+
+task: |
+  Implement `smart_sort(arr: list[int]) -> list[int]` that:
+    1. Returns a sorted (ascending) list
+    2. Is stable (relative order of equal elements preserved — but ints, so trivial)
+    3. Beats Python's built-in `sorted()` on inputs that are 95%+ already sorted
+
+success_criteria:
+  - axis: correctness
+    weight: 0.6
+    test: |
+      import random
+      assert smart_sort([]) == []
+      assert smart_sort([1]) == [1]
+      assert smart_sort([3, 1, 2]) == [1, 2, 3]
+      assert smart_sort([5, 5, 5]) == [5, 5, 5]
+      # random
+      for _ in range(20):
+          a = [random.randint(0, 1000) for _ in range(500)]
+          assert smart_sort(a) == sorted(a)
+  - axis: performance
+    weight: 0.4
+    target: "On 95%-sorted input of 100,000 ints, smart_sort wall time ≤ 0.9× sorted()"
+    measure: speedup_ratio
+    threshold: 0.9
+
+budget:
+  max_cycles: 5
+  max_redo: 3
+  max_usd: 1.0

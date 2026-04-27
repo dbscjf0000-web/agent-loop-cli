@@ -1,0 +1,323 @@
+## Codebase Patterns (최상단 고정)
+- 이 프로젝트는 standalone CLI (Python). Claude Code 의존성 없음.
+- 모델 추상화: litellm + cursor-agent CLI (subprocess) 듀얼 provider.
+  `cursor` / `cursor/<m>` 모델 id는 `_call_cursor_cli`로 분기, 그 외는 litellm.
+- cursor-agent는 자체 agentic CLI — 호출 1회에 30s~5min 가능. 모든 phase에 workspace
+  넘기면 동일 디렉토리에서 작업 (각 phase가 다른 phase의 산출물을 볼 수 있음).
+- cursor-agent는 `~/.cursor/projects/<sanitized-cwd>/` 디렉토리를 작성해야 함 —
+  KISTI inode quota 가득 차면 errno 122. `~/.cache/claude-cli-nodejs/-scratch-*` 정리로 해결.
+- 오케스트레이션: Code (Python) + LLM Judge 하이브리드. 완전 LLM orchestrator 아님.
+- 핵심 사이클: R → P → I → V → J (5단계, plugin과 동일 시맨틱).
+- Stateless 원칙: Phase Worker는 fresh context, 모든 상태는 .agent_loop/ 파일에.
+- 병렬 처리: v0.1엔 직렬만. v0.3에서 multi-strategy/multi-judge.
+- v0.1 미니멀 4 레이어: CLI → Orchestrator → Phase Workers → State.
+- 6개 엔진 분리 (Context/Verify/Judge Engine 등)는 v0.2+에서 필요시 추출. YAGNI.
+- 한국어 응답 (기술 용어는 영어). 부모는 직접 코드 작성 X, 워커에 위임.
+- 빌드 시스템: hatchling (단순함). `[tool.hatch.build.targets.wheel] packages = ["src/agent_loop"]`.
+- toml 로딩: Python 3.11+ stdlib `tomllib`, 3.10은 `tomli` 폴백 (`sys.version_info` 분기).
+- KISTI에서 검증: `module load python/3.12.4` (실제로 3.14.2가 로드됨), `pip install -e ".[dev]" --user`.
+- 모든 phase worker 호출은 `agent_loop.models.call_model(phase, prompt, system, config)`로 단일화.
+  - phase는 `Literal["research","plan","implement","verify","judge"]` 5개 고정.
+- TaskDir 디렉토리 layout 변경 시 `init()`과 `list_tasks()` 휴리스틱 둘 다 갱신해야 함.
+- Test에서 litellm 호출은 monkeypatch로 `litellm.completion` + `litellm.completion_cost` 둘 다 패치.
+- v0.1.0 호출 entry point: `python3 -m agent_loop.cli` (KISTI inode 이슈 시). `module load python/3.12.4`는 같은 셸에서만 적용 — 매 Bash invocation 앞에 붙일 것.
+- `bench` 명령은 yaml `budget.max_cycles` / `max_redo`가 default; CLI `--cycles` / `--max-redo` 플래그가 override; `--dry-run`이면 task.md만 쓰고 LLM 호출 X (env에 API 키 없을 때 smoke 검증 경로).
+
+---
+
+## [2026-04-27 12:19] - 프로젝트 초기 셋업
+- 구현: 폴더 생성, git init, 초기 문서 골격
+- 변경 파일: progress.txt, docs/plan-v0.1.md, README.md
+- 상태: 완료
+- 학습:
+  - 패턴: 새 프로젝트 시작은 반드시 progress.txt + docs/plan-*.md 먼저
+  - 주의사항: agent-loop-plugin과 이름 충돌 회피 → agent-loop-cli
+---
+
+## [2026-04-27 12:25] - Plan 결정사항 확정 + 벤치 task 4개 추가
+- 구현: plan 12절 결정, benchmarks/*.yaml 4개, benchmarks/README.md
+- 변경 파일: docs/plan-v0.1.md (4·9·12절), benchmarks/n_queens.yaml,
+  benchmarks/binary_search.yaml, benchmarks/sort_tuning.yaml,
+  benchmarks/palindrome.yaml, benchmarks/README.md
+- 상태: 완료
+- 다음 할 일:
+  1. **워커 1 spawn**: 작업 #1~#4 (패키지 골격 + config + state + models) 일괄
+     - pyproject.toml (typer, litellm, pydantic, rich, tomli; Python ≥3.10)
+     - src/agent_loop/__init__.py, config.py, state.py, models.py
+     - tests/test_state.py, tests/test_models.py 최소 1개씩
+  2. 워커 결과 검토 후 progress.txt 갱신
+  3. 워커 2 spawn: 작업 #5~#8 (prompts + workers + orchestrator + cli)
+  4. 워커 3 spawn: 작업 #9~#10 (resume + benchmarks 검증 + README 보강)
+- 결정 사항 (확정):
+  - 패키지명: agent-loop-cli (PyPI), import는 agent_loop
+  - Python ≥ 3.10
+  - Config: ~/.agent-loop/config.toml + ./agent-loop.toml override
+  - rich 풀활용
+- 학습:
+  - 패턴: 결정 위임받은 부분은 reasonable default 한 번에 정하고 plan에 ✅ 표시
+---
+
+## [2026-04-27 12:30] - 작업 #1~#4 (패키지 골격 + 기반 모듈)
+- 구현:
+  - pyproject.toml: hatchling 빌드, Python ≥3.10, deps (typer / litellm / pydantic /
+    rich / pyyaml / tomli@<3.11), entry point `agent-loop = "agent_loop.cli:app"`,
+    dev extra (pytest), pytest configfile.
+  - src/agent_loop/__init__.py: `__version__ = "0.1.0"`만.
+  - src/agent_loop/cli.py: 임시 typer 스텁 (`--version` 동작). 다음 워커가 덮어씀.
+  - src/agent_loop/config.py: `Models`/`Budget`/`Runtime`/`Config` (pydantic v2),
+    `load_config(explicit_path?)` 우선순위 (명시 > ./agent-loop.toml > ~/.agent-loop/config.toml > 기본),
+    9개 환경변수 override, `init_default_config()`.
+  - src/agent_loop/state.py: `TaskDir(root, task_id)` + `init/write_artifact/
+    read_artifact/append_metric/save_checkpoint/load_latest_checkpoint/
+    workspace_path/task_md_path/memory_md_path`. JSON 자동 직렬화. metric에 ts 자동 부착.
+    체크포인트는 `cycle_NNN_phase_X.json` 형식 (sort 안전성). `new_task_id()` 6자 hex.
+    `list_tasks(root)`는 artifacts/checkpoints/telemetry 중 하나라도 있으면 task로 인식.
+  - src/agent_loop/models.py: `ModelResponse` dataclass + `call_model(phase, prompt,
+    system, config, *, temperature=0, max_tokens, extra)`. usage / cost / latency 측정,
+    RateLimitError 1회 재시도 (1.5s sleep). 사용 예 docstring 포함.
+  - tests/test_state.py: roundtrip + list_tasks + new_task_id 분포 (3 tests).
+  - tests/test_models.py: 기본 호출 / phase 라우팅 / RateLimit 재시도 (3 tests, 모두 monkeypatch).
+- 변경 파일: pyproject.toml, src/agent_loop/{__init__.py,cli.py,config.py,state.py,models.py},
+  tests/{test_state.py,test_models.py}
+- 상태: 완료
+- 검증:
+  - `module load python/3.12.4` (실제 3.14.2 redirect) 후 `pip install -e ".[dev]" --user` 성공.
+  - `python3 -m pytest tests/ -v` → **6 passed in 2.85s**.
+  - `agent-loop --version` → `0.1.0`.
+  - 모든 모듈 import smoke test 성공.
+- 다음 할 일: 워커 2가 prompts + workers + orchestrator + cli 작성
+  - src/agent_loop/prompts/{research,plan,implement,verify,judge}.md 5개
+  - src/agent_loop/workers.py: 5개 phase 함수, 각각 `TaskDir`만 받아 artifacts 읽고 쓰기.
+    호출은 `models.call_model(phase, ...)`로 일원화.
+  - src/agent_loop/orchestrator.py: R→P→I→V→J 루프, judge 결과로 `redo_R`/`redo_P`/`stop`,
+    `best_solution.json` 롤백, 매 phase 끝에 `save_checkpoint`.
+  - src/agent_loop/cli.py: 임시 스텁 덮어쓰기. `run/list/resume/config init|edit|show` 명령.
+- 학습:
+  - 패턴:
+    - litellm.completion 의 응답은 OpenAI ChatCompletion 호환 (choices[0].message.content + usage).
+      `_extract_text/_extract_usage`는 객체와 dict 둘 다 받음 → 모킹 시 둘 중 편한 쪽 사용.
+    - Pydantic v2의 `model_validate` 사용 (`parse_obj` 대신).
+    - hatchling은 `src/`-layout이면 `[tool.hatch.build.targets.wheel] packages = ["src/agent_loop"]` 명시 필요.
+  - 주의사항:
+    - KISTI Python 3.9가 기본 — 반드시 `module load python/3.12.4` 먼저.
+      모듈은 deprecated라 실제 로드는 3.14.2지만 동작은 동일.
+    - `pyproject.toml` `requires-python = ">=3.10"`이므로 모듈 로드 안 하면 install 실패.
+    - 다음 워커가 `cli.py`를 덮어쓸 때 entry point 이름은 `app`으로 유지 (pyproject scripts 기준).
+    - `litellm.completion_cost`는 mock 응답에 대해 raise할 수 있어 `_safe_cost`로 감싸 0.0 폴백.
+    - `state.py`에서 디렉토리 layout 변경 시 `list_tasks` 휴리스틱도 같이 수정.
+---
+
+## [2026-04-27 12:50] - 작업 #5~#8 (프롬프트/워커/오케/CLI)
+- 구현:
+  - prompts/{research,plan,implement,verify,judge}.md (5개, 합 310 lines).
+    - placeholder 명세: research={task,memory}, plan={task,memory,findings},
+      implement={task,plan,best_solution_summary},
+      verify={task,plan,execution_log,workspace_listing,solution_code,import_check},
+      judge={task,solution,best_solution,memory,redo_count,max_redo}.
+  - workers.py (312 lines): run_research/run_plan/run_implement/run_verify/run_judge 5개 함수.
+    - 헬퍼: _load_prompt(importlib.resources + 파일 폴백),
+      _extract_python(첫 ```python 블록), _extract_json(direct→fence→brace),
+      _import_check(subprocess `python -c "import solution"` 5s timeout),
+      _workspace_listing(rglob), _read_or, _current_redo_count.
+    - run_judge는 best_solution.json 없으면 LLM call 스킵 → ModelResponse 가짜 반환 (비용 0).
+  - orchestrator.py (280 lines): Orchestrator 클래스 + RunResult dataclass.
+    - resume: load_latest_checkpoint() → cycle/phase 자동 결정.
+      마지막 phase가 judge면 cycle+1 from research, 아니면 next_phase부터.
+    - judge.better=true → solution.json + solution.py를 best_*로 promote.
+    - judge.better=false → best_*를 solution_*로 rollback, redo_count++.
+    - action="stop" / max_redo 도달 / budget 초과 시 break.
+    - rich Console로 phase 진행 출력. supervised 모드에선 plan 후 typer.confirm.
+    - matrix metric 매 phase 끝에 append (cycle, phase, tokens, cost, latency, model).
+  - cli.py (297 lines, 스텁 덮어씀): typer.Typer `app`. 명령:
+    - run / list / resume / bench / models / config init|show|edit / --version.
+    - rich Table로 결과 출력. _bench_to_task_md는 yaml→task.md 변환.
+    - benchmarks/ 디렉토리 자동 탐색 (cwd → 패키지 부모 → 패키지).
+  - tests/test_workers.py (10 tests): _extract_json 4개, _extract_python 2개,
+    run_judge 2개, run_research 1개, run_implement 1개.
+  - tests/test_orchestrator.py (2 tests): 1-cycle stop 흐름, max_redo break 흐름.
+  - tests/test_cli.py (5 tests): typer CliRunner로 --version/help/config init --print/
+    models/list 빈 디렉토리.
+- 변경 파일:
+  - 신규: src/agent_loop/prompts/{research,plan,implement,verify,judge}.md,
+    src/agent_loop/{workers,orchestrator}.py, tests/{test_workers,test_orchestrator,test_cli}.py
+  - 수정: src/agent_loop/cli.py (덮어씀, app 변수 유지), pyproject.toml
+    (`[tool.hatch.build.targets.wheel].include = ["src/agent_loop/prompts/*.md"]` 추가)
+- 상태: 완료
+- 검증:
+  - `python3 -m pytest tests/ -v` → **23 passed in 2.42s** (이전 6 + 새 17).
+  - `python3 -m agent_loop.cli --version` → `0.1.0`.
+  - `--help`, `run --help`, `config init --print`, `list --root /tmp/no_such`,
+    `models` 모두 정상 출력 확인.
+  - 환경 함정: `/home01/a2021a01` inode quota (98976/100000) 거의 가득 차서
+    `pip install -e .` 신규 install/reinstall은 OSError 122 (Disk quota exceeded)로 실패.
+    하지만 워커 1이 이미 editable install 해 둔 덕에 src/ 변경은 즉시 반영되며
+    `python3 -m agent_loop.cli` 경로는 동작. 다음 워커는 inode 정리 후
+    `python3 -m pip install -e . --no-deps --user`로 entry-point 재생성 권장.
+- 다음 할 일: 워커 3가 작업 #9~#10 진행
+  - 실제 LLM 호출 가능한 환경에서 `agent-loop bench --quick`(binary_search)
+    1회 success path 검증.
+  - 실패 시 prompts 튜닝 (특히 verify/judge JSON 정확성, implement 코드 블록 형식).
+  - README.md 본격 작성: install / quickstart / config / state layout / 예제.
+  - inode quota 정리 (불필요한 site-packages 폴더 정리 후) entry-point 재설치.
+  - (선택) LITELLM_LOG=DEBUG 로 1회 실제 호출 확인.
+- 학습:
+  - 패턴:
+    - importlib.resources.files(pkg).joinpath() 사용 시 editable install이면
+      파일 폴백(Path(__file__).parent / "prompts" / name)이 더 안정.
+      두 경로 모두 갖춘 _load_prompt 헬퍼로 둘 다 커버.
+    - LLM JSON 추출은 3-tier (direct → ```fence → 첫 `{`-마지막 `}`)면 거의 다 잡힘.
+      추출 실패 시 fallback dict에 "_raw" 필드로 원문 일부(2KB)를 남기면 디버깅 쉬움.
+    - typer 서브앱은 `add_typer(config_app, name="config")` + `no_args_is_help=True`로
+      `agent-loop config` 단독 호출 시 도움말 자동 출력.
+    - rich 색상 markup은 Windows/CI 등 비-tty에서도 자동 비활성. 명시적 분기 불필요.
+  - 주의사항:
+    - 프롬프트의 `{}` placeholder는 str.format에서 escape 필요. JSON 예시 본문에
+      `{{ "key": ... }}` 처럼 이중 중괄호 사용해야 KeyError 방지.
+    - run_implement는 LLM 응답에서 ```python 블록을 추출 못하면 solution.py를
+      쓰지 않음 (workspace 비어 있음). 후속 verify 단계에서 import_check가
+      "FAIL: workspace/solution.py does not exist" 보고 → correctness 자동 깎임.
+      이 동작이 의도된 것이지만 다음 워커가 첫 cycle에서 "왜 0점이지?" 헷갈릴 수 있음.
+    - orchestrator의 budget 체크는 매 phase 후. cycle 단위가 아님.
+      "1 cycle 끝까지는 채우고 break" 같은 정책이 필요하면 분리 필요.
+    - `solution.py` snapshot은 `best_solution.py`에 별도 보관. rollback 시 양쪽 다 복원.
+    - `run_judge`의 first-cycle 자동 better=true 분기는 weighted_score >= 0.95면
+      action="stop"으로 끝낼 수도 있음 — 운 좋으면 1 cycle만에 끝남. 정상 동작.
+---
+
+## [2026-04-27 12:55] - 작업 #9~#10 (벤치 검증 + README + 아키텍처 문서)
+- 구현:
+  - cli.py `bench` 명령에 `--dry-run` / `--cycles` / `--max-redo` 플래그 추가.
+    `--dry-run`은 yaml→task.md 작성 + TaskDir.init() 까지만; LLM 호출 0회.
+    yaml의 `budget.max_cycles`가 default, CLI 플래그가 override.
+  - README.md 풀버전 작성 (한국어 X, 마케팅 톤 X). 섹션:
+    Status / Why / Install / Quickstart / Configuration (env var 표 + provider 표 +
+    multi-vendor 프리셋) / State directory layout / Benchmarks / Migration from
+    agent-loop-plugin / Troubleshooting (inode quota / module load / placeholder
+    escaping / empty task.md) / Roadmap / License / Related.
+  - docs/architecture.md 신규 (plan-v0.1.md 5절 추출): ASCII 다이어그램 + 모듈
+    책임표 + Phase contract 표 + Judge 스키마 + v0.2+ 추출 자리 (Context/Verify
+    Engine, Judge Strategy, Plan Strategy, Tool/MCP Bridge) + non-goals.
+  - .gitignore 신규 (.agent_loop/, __pycache__/, *.egg-info/, .pytest_cache/, etc.).
+- 변경 파일:
+  - 신규: docs/architecture.md, .gitignore
+  - 수정: src/agent_loop/cli.py (bench 명령에 --dry-run/--cycles/--max-redo 추가),
+    README.md (1.2KB 골격 → 6.5KB 풀버전), progress.txt (Codebase Patterns + 이 항목)
+- 상태: 완료 + v0.1.0 release 가능 (라이브 LLM 미실행은 환경 제약, 차단 이슈 X)
+- 검증:
+  - `python3 -m pytest tests/ -q` → **23 passed in 2.42s** (이전과 동일, regression 0).
+  - `python3 -m agent_loop.cli --version` → `0.1.0`.
+  - `python3 -m agent_loop.cli models` → 5 phase 모델 mapping rich Table 출력.
+  - `python3 -m agent_loop.cli list --root /tmp/no_such` → "No tasks under ..." 정상.
+  - `python3 -m agent_loop.cli bench --dry-run --root /tmp/al_all` → 4개 벤치
+    (binary_search/n_queens/palindrome/sort_tuning) 모두 task.md 작성 + TaskDir layout
+    (artifacts/checkpoints/telemetry/workspace + memory.txt) 생성 확인.
+  - `python3 -m agent_loop.cli list --root /tmp/al_all` → 4 task rich Table 출력.
+  - 라이브 LLM 호출: **스킵** (env에 ANTHROPIC_API_KEY 없음. AZURE_OPENAI_API_KEY만
+    있으나 default config가 anthropic/* 모델 사용 → 호환 안 됨). README의 라이브 출력
+    예시는 가상 출력이라고 명시.
+  - `git status`: master branch, no commits yet, 8개 untracked path commit 가능
+    (.gitignore, README.md, benchmarks/, docs/, progress.txt, pyproject.toml, src/, tests/).
+    **commit 안 함** (사용자 명시 요청 X).
+- 알려진 한계 (다음 버전 후보):
+  1. **라이브 LLM run 미검증**: KISTI 환경에 ANTHROPIC API 키 없음. CCB/Azure 프록시
+     경유 (azure/gpt-5.2 등) 모델 매핑은 v0.1.1에서 검증 필요. 빌드 자체는 health.
+  2. **inode quota 회피용 entry-point 부재**: `agent-loop` 명령이 PATH에 안 깔림.
+     `pip install` 재시도 + `python3 -m agent_loop.cli` 폴백 alias 둘 다 README 명시.
+  3. **Verify import-check가 단일 5s subprocess만 사용**: 큰 task가 import에 5초
+     이상 걸리면 false negative 가능. v0.2 Verify Engine에서 다축 rubric으로 분리.
+  4. **Budget 체크가 phase 단위, cycle 단위 아님**: cycle 도중 break 시 partial
+     artifacts 남음. 정책에 따라 "1 cycle 끝까지는 채움" 분기가 필요할 수 있음.
+  5. **Memory 누적이 단일 memory.txt + judge `hint`만**: 3-tier (procedural/
+     episodic/semantic) 분리는 v0.2에 위임. 현재는 cumulative bullet list만.
+- 학습:
+  - 패턴:
+    - `module load python/3.12.4` 효과는 같은 셸 한정. 매 Bash invocation에서
+      `module load python/3.12.4 >/dev/null 2>&1 && python3 ...` 패턴 사용.
+    - `--dry-run` 플래그는 LLM 호출 0회로 yaml 파싱/TaskDir layout/CLI argparse
+      regression을 모두 잡는 가장 싼 smoke. CI에 그대로 박을 수 있음.
+    - typer Optional[int] + None 분기로 yaml budget vs CLI flag 우선순위 구현.
+  - 주의사항:
+    - README의 라이브 출력 예시는 "(illustrative — not executed in the build environment)"
+      라고 명시. 거짓 데이터 만들지 않기.
+    - `bench --dry-run` 후 `list`로 확인하는 흐름이 가장 빠른 health check.
+    - .gitignore에 `.agent_loop/` 포함 — 벤치 결과는 commit하지 말 것.
+---
+
+## [2026-04-27 13:40] - v0.1.1 cursor-agent 통합 + e2e 라이브 검증
+- 구현:
+  - `src/agent_loop/models.py` 리팩토링: `_call_cursor_cli(prompt, system, *, model, workspace, timeout)`
+    추가, `_call_litellm()` 분리, `call_model()` 디스패처가 `_is_cursor_model()` 검사 후 분기.
+    cursor 호출은 `# System\n...\n# Task\n...` 렌더링 + `--print --output-format text --force --trust
+    --workspace --model` 플래그. cost_usd=0.0 (Pro 가정), tokens=char/4 추정. 타임아웃 600s 기본.
+  - `src/agent_loop/workers.py` 5개 phase 모두 `call_model(..., workspace=task_dir.workspace_path())`
+    추가. litellm 분기는 무시, cursor 분기는 `--workspace`로 격리.
+  - `src/agent_loop/cli.py`:
+    - `models` 명령에 `cursor-agent --list-models` 결과 (or `_KNOWN_CURSOR_MODELS` 폴백) 두 번째
+      Rich Table로 추가.
+    - 신규 `doctor` 명령: Python 버전, config 출처, 4개 env key (마스킹), cursor-agent PATH +
+      `cursor-agent status`, litellm 버전을 Rich Table.
+    - 신규 `test-model <id>` 명령: "Reply with OK" 단발 호출. cursor면 `_call_cursor_cli`,
+      그 외엔 `_call_litellm` 직접 호출. latency / cost / token / model 출력.
+  - `src/agent_loop/__init__.py`: `__version__ = "0.1.1"`.
+  - `tests/test_cli.py`: 버전 단언을 `__version__` 동적 비교로.
+  - `tests/test_cursor_cli.py` 신규 (9 tests): `_is_cursor_model`/`_cursor_model_arg` 단순,
+    `_call_cursor_cli` 정상/실패/타임아웃/binary missing, `call_model` 디스패치 (cursor → CLI,
+    non-cursor → litellm). 모두 `subprocess.run` + `shutil.which` monkeypatch.
+  - `README.md` v0.1.1 status, 라이브 e2e 결과 (real Run summary), Cursor (CLI) provider 섹션,
+    All-cursor preset, Roadmap에 v0.1.1 항목.
+  - `docs/architecture.md` provider box를 "Two provider paths" (litellm + cursor-agent CLI)로,
+    `models.py` 책임 한 줄에 cursor 분기 명시.
+- 변경 파일:
+  - 수정: src/agent_loop/{__init__.py, models.py, workers.py, cli.py},
+    tests/test_cli.py, README.md, docs/architecture.md, progress.txt
+  - 신규: tests/test_cursor_cli.py
+- 상태: 완료. v0.1.1 release 가능.
+- 검증:
+  - pytest: **32 passed in 4.11s** (이전 23 + 신규 9, regression 0).
+  - `agent-loop --version` → `0.1.1`.
+  - `agent-loop doctor` → python OK, cursor-agent PATH OK + `Logged in as dbscjf0000@gmail.com`,
+    litellm OK. ANTHROPIC/OPENAI/GEMINI/CURSOR_API_KEY 모두 unset (예상).
+  - `agent-loop test-model cursor/auto` → response='OK', latency 12.5s, cost=0.0.
+  - `agent-loop models` → 5 phase Rich Table + cursor-agent 모델 리스트 (auto, composer-2,
+    gpt-5.3-codex-*, gpt-5.2 등).
+  - **e2e 라이브** (5 phase 모두 cursor/auto):
+    ```
+    python3 -m agent_loop.cli run "Implement binary_search(arr, target) -> int returning index or -1"
+        --config /tmp/al_e2e/config.toml --root /tmp/al_e2e/.agent_loop
+        --cycles 2 --max-redo 1 --mode auto
+    ```
+    - task_id=1fc5bb, cycles_run=1, final_status=stop (judge auto-stop @ score 0.973 ≥ 0.95).
+    - phase별 latency: research 60.2s / plan 30.6s / implement 96.2s / verify 41.8s / judge 0s
+      (1st cycle skip).
+    - workspace에 cursor-agent가 `binary_search.py` (cursor가 자율적으로 만든 모듈) +
+      `test_binary_search.py` 도 작성. `solution.py` 643B (워커가 LLM 응답에서 ```python``` 추출).
+    - 코드 품질: 정석 binary search (low/high overflow-safe mid 계산), Sequence[Any] 타입 힌트,
+      docstring 포함. import_check OK.
+- 알려진 한계:
+  - cursor-agent의 첫 호출 시 `~/.cursor/projects/<sanitized-cwd>/` 디렉토리 생성이 필요해
+    inode quota 가득 차면 errno 122 발생. README troubleshooting 추가 후보.
+    이번 작업에서 `~/.cache/claude-cli-nodejs/-scratch-a2021a01-RPI-ralph-test-v15/v16` 삭제로
+    ~2400 inode 회수해 해결.
+  - cursor-agent는 phase당 30s~96s 걸림 — 5 phase × 2 cycle = 약 8분 예상. CCB/Pro 사용 시
+    워크플로 단계당 latency 부담은 litellm과 비교해 큰 편 (대신 자체 agentic 도구 사용 가능).
+  - cursor 모델은 token/cost 정확하지 않음 (char/4 추정, cost_usd=0). budget 가드는 cursor에서
+    사실상 비활성. 필요 시 phase 카운트 기반 게이트 추가.
+- 학습:
+  - 패턴:
+    - cursor-agent는 `--print --force --trust` 조합이 non-interactive + 모든 도구 자동 승인.
+      `--workspace` 플래그로 cwd 격리 가능.
+    - subprocess provider 어댑터는 `shutil.which` + `subprocess.run`만 stdlib로 충분 — 의존성 추가 X.
+    - `--list-models` 출력은 첫 줄이 헤더("Available")인 경우가 있음. 단순 split 후
+      filter (lstrip "-* ") 정도로 충분.
+    - cursor-agent가 `solution.py` 외 다른 파일 (test_*.py, sub-modules)을 자율적으로 생성할 수
+      있음 — workspace listing이 의외로 풍부해짐. 후속 verify가 그걸 다 본다.
+  - 주의사항:
+    - cursor-agent stderr는 짧지만 빈 줄 + ANSI escape 포함. error 메시지 표시 시 `.strip()` +
+      `[-2000:]` slice가 안전.
+    - litellm 미설치 환경에서도 cursor만 쓰는 시나리오가 가능 — 단, `_call_litellm`은 import만
+      되고 호출 안 되면 OK. `import litellm` 실패 시 `models.py` 자체가 import 실패하므로
+      여전히 dep로 필요. (v0.2 candidate: lazy import)
+    - cursor의 응답에는 종종 마크다운 블록 외 prose가 풍부 — `_extract_python` 첫 ```python```
+      블록만 잡으므로 implementer는 코드를 가장 위에 두는 프롬프트 디자인이 안전 (현재 prompts/
+      implement.md가 그렇게 되어 있음).
+---

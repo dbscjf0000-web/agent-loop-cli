@@ -1,0 +1,35 @@
+name: longest-palindrome
+category: string
+description: |
+  Find the longest palindromic substring. Tests string handling, edge cases,
+  and basic algorithmic skill (Manacher / expand-around-center).
+
+task: |
+  Implement `longest_palindrome(s: str) -> str` that returns the longest palindromic
+  substring of `s`. If multiple have the same max length, return the leftmost.
+  Empty input returns empty string.
+
+success_criteria:
+  - axis: correctness
+    weight: 0.7
+    test: |
+      assert longest_palindrome("") == ""
+      assert longest_palindrome("a") == "a"
+      assert longest_palindrome("ab") in ("a", "b")
+      assert longest_palindrome("babad") in ("bab", "aba")
+      assert longest_palindrome("cbbd") == "bb"
+      assert longest_palindrome("racecar") == "racecar"
+      assert longest_palindrome("abacdfgdcaba") == "aba"
+      # 2000-char input must finish quickly
+      s = "a" * 2000
+      assert longest_palindrome(s) == s
+  - axis: performance
+    weight: 0.3
+    target: "On 2000-char input, finishes in ≤ 1.0s"
+    measure: wall_clock_seconds
+    threshold: 1.0
+
+budget:
+  max_cycles: 4
+  max_redo: 3
+  max_usd: 0.7

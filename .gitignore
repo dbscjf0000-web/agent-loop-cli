@@ -1,0 +1,11 @@
+.agent_loop/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+.coverage
+*.swp
+.DS_Store

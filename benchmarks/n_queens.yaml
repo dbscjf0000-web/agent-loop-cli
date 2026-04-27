@@ -1,0 +1,34 @@
+name: n-queens
+category: algorithm
+description: |
+  Pure Python implementation of N-Queens counting function.
+  Must be efficient enough to handle N=13 within strict time budget.
+
+task: |
+  Implement a function `n_queens_count(n: int) -> int` in pure Python (no C extensions, no numpy)
+  that returns the number of distinct solutions to the N-Queens problem.
+
+success_criteria:
+  - axis: correctness
+    weight: 0.5
+    test: |
+      assert n_queens_count(1) == 1
+      assert n_queens_count(4) == 2
+      assert n_queens_count(5) == 10
+      assert n_queens_count(6) == 4
+      assert n_queens_count(8) == 92
+      assert n_queens_count(9) == 352
+      assert n_queens_count(10) == 724
+      assert n_queens_count(11) == 2680
+      assert n_queens_count(12) == 14200
+      assert n_queens_count(13) == 73712
+  - axis: performance
+    weight: 0.5
+    target: "n_queens_count(13) finishes in ≤ 1.5s on a single CPU core"
+    measure: wall_clock_seconds
+    threshold: 1.5
+
+budget:
+  max_cycles: 5
+  max_redo: 3
+  max_usd: 1.0
