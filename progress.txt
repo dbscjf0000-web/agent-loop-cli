@@ -1,8 +1,16 @@
 ## Codebase Patterns (최상단 고정)
 - v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
 - 이 프로젝트는 standalone CLI (Python). Claude Code 의존성 없음.
-- 모델 추상화: litellm + cursor-agent CLI (subprocess) 듀얼 provider.
-  `cursor` / `cursor/<m>` 모델 id는 `_call_cursor_cli`로 분기, 그 외는 litellm.
+- 모델 추상화: litellm + 3개 CLI provider (cursor / claude / gemini, 모두 subprocess).
+  `cursor/<m>` / `claude/<m>` / `gemini/<m>` 모델 id는 `_cli_provider()` 헬퍼가
+  ("cursor"|"claude"|"gemini"|None) 반환 후 분기, None 이면 litellm. cli_timeout
+  파라미터로 모든 CLI subprocess 의 timeout 통일 (cursor_timeout 은 호환 alias).
+- claude (Claude Code CLI): `--print --output-format text --dangerously-skip-permissions
+  --add-dir <ws> "<prompt>"`. `--bare` 는 ANTHROPIC_API_KEY 강제이므로 사용 X (사용자
+  OAuth 로그인 유지). 구독 사용자 인증.
+- gemini CLI: `-p "<prompt>" -m <model> --output-format text --yolo --skip-trust
+  --include-directories <ws>`. Node v22 필수. gemini-2.5-pro 첫 호출 cold start 가
+  60+s (90s timeout 부족), gemini-2.5-flash 는 ~8s. judge phase 에 flash 권장.
 - cursor-agent는 자체 agentic CLI — 호출 1회에 30s~5min 가능. 모든 phase에 workspace
   넘기면 동일 디렉토리에서 작업 (각 phase가 다른 phase의 산출물을 볼 수 있음).
 - cursor-agent는 `~/.cursor/projects/<sanitized-cwd>/` 디렉토리를 작성해야 함 —
@@ -579,4 +587,91 @@
       비교, redo 흐름) 는 검증 안 됨 — 별도 stress test 가 v0.3 candidate.
     - cursor-agent 의 cost/token 추정 (char/4) 라서 metrics.jsonl 의 tokens 값 (493/438 등)
       은 참고용. 실제 비용 정밀 추적 불가능 — Pro subscription 가정.
+---
+
+## [2026-04-27 15:20] - v0.2.1 claude/gemini CLI provider + cross-vendor live e2e
+- 구현:
+  - `src/agent_loop/models.py`: `_call_claude_cli` (~75 줄) + `_call_gemini_cli` (~75 줄)
+    + `_is_claude_model` / `_claude_model_arg` / `_is_gemini_model` / `_gemini_model_arg`
+    + `_cli_provider(model) -> "cursor"|"claude"|"gemini"|None` 통합 dispatcher.
+    `call_model()` 에 `cli_timeout` 파라미터 추가 (cursor_timeout 은 alias 유지).
+    claude: `--print --output-format text --dangerously-skip-permissions --add-dir <ws>`.
+    gemini: `-p <prompt> -m <model> --output-format text --yolo --skip-trust
+    --include-directories <ws>`. cost_usd=0, tokens char/4 추정.
+  - `src/agent_loop/cli.py`:
+    - imports 갱신 (3 CLI 함수 + helpers + `_cli_provider`).
+    - `doctor` 명령에 claude / gemini PATH + version + node v22+ 체크 4행 추가.
+    - `models` 명령에 claude/gemini 정적 모델 리스트 Rich Table 추가.
+    - `test-model` 명령이 `_cli_provider` 분기 사용으로 단순화.
+    - `_KNOWN_CLAUDE_MODELS=("default",)`, `_KNOWN_GEMINI_MODELS=("gemini-2.5-pro",
+      "gemini-2.5-flash")`, `_list_claude_models()` / `_list_gemini_models()` 헬퍼.
+  - `src/agent_loop/__init__.py`: `__version__ = "0.2.1"`.
+  - `tests/test_claude_cli.py` 신규 (7 tests): cursor 패턴 그대로 — predicate /
+    arg_translation / success / failure / timeout / missing binary / dispatch.
+  - `tests/test_gemini_cli.py` 신규 (7 tests): 같은 패턴, gemini-2.5-pro 검증.
+  - `README.md`: Status 를 v0.2.1 로 업데이트, "Provider credentials" 표에 Claude
+    Code (CLI) / Gemini (CLI) 행 추가, "Claude Code CLI" + "Gemini CLI" 서브섹션
+    추가, "All-CLI cross-vendor preset" 신규 toml 예시, "Cross-vendor live e2e
+    (v0.2.1)" 결과 섹션 신규.
+  - `docs/architecture.md`: Layered view 의 "Model Router" 박스를 "litellm + 3 CLIs"
+    로 확장, models.py 책임 행 갱신 (3 CLI 분기 + `_cli_provider`).
+- 변경 파일:
+  - 신규: tests/{test_claude_cli.py, test_gemini_cli.py}
+  - 수정: src/agent_loop/{__init__.py, models.py, cli.py}, README.md,
+    docs/architecture.md, progress.txt
+- 상태: 완료. v0.2.1 release 가능.
+- 검증:
+  - `python3 -m pytest tests/ -q` → **77 passed in 4.39s** (이전 63 + 신규 14, regression 0).
+    분포: test_claude_cli.py 7 + test_gemini_cli.py 7.
+  - `agent-loop doctor`: cursor-agent OK + Logged in / claude 2.1.119 OK / gemini 0.39.1 OK
+    / node v22.22.2 OK / litellm OK. 4개 env key 모두 unset (예상; CLI 자체 인증).
+  - **단발 ping 3 vendor**:
+    - `test-model cursor/auto`           → 'OK', latency 11.82s
+    - `test-model claude/default`        → 'OK', latency 10.27s
+    - `test-model gemini/gemini-2.5-pro` → **timeout @ 90s** (cold start 60+s)
+    - `test-model gemini/gemini-2.5-flash` → 'OK', latency 8.19s ✅
+  - **Cross-vendor live e2e** (`bench binary_search`,
+    config: research/plan/implement=cursor, verify=claude, judge=gemini-2.5-flash):
+    task_id=bench-binary_search-06627c, root=/tmp/al_3vendor/.agent_loop/.
+    Total wall ~77s, weighted_score=**1.000**, cycles_run=1, final_status=stop.
+    Phase latency: research 25.9s / plan 39.6s / implement 11.6s / verify 0.03s
+    (verify_engine: rubric short-circuit) / judge 0.0s (first-cycle skip).
+    correctness=1.0 (10/10 asserts pass) + complexity=1.0 (ast_grep 2/2 rules).
+    중요 발견: rubric 가 있는 bench task 는 v0.2 Verify Engine 이 LLM 우회 → 이번
+    cycle 에 claude / gemini 모두 호출 0회. provider 통합 자체는 ping 3종으로 검증됨.
+  - **legacy verify path 검증 시도** (gcd task, free-form `run` 명령): R/P/I 통과 후
+    claude verify @ 600s timeout. claude --print 가 자체 agentic CLI 라 긴 prompt
+    에 대해 매우 느림. v0.3 후보: rubric 자동 생성 (간단 task 도) + claude verify
+    timeout 보다 짧게 + bare 모드 (ANTHROPIC_API_KEY 보유 시).
+- 알려진 한계 / 다음 워커가 알아야 할 함정:
+  1. **gemini-2.5-pro cold start 60-140s** — 90s timeout 으로는 부족. judge phase
+     에 매핑하면 build phase 끝나자마자 cold-start 페널티 한 번 발생. flash 가
+     ping/judge 에는 정답.
+  2. **claude --print 는 agentic** — 단순 "OK" ping 은 10s 이지만 5KB legacy verify
+     prompt 는 600s 도 부족. v0.3 에서 claude phase 에 cli_timeout 별도 노출 권장.
+  3. **--bare 모드 미사용** — Claude Code 의 `--bare` 가 빠르고 격리 강하지만
+     `ANTHROPIC_API_KEY` 강제. 우리 워크플로 (사용자 구독) 와 호환 X. 만약 회사
+     API key 가 있으면 v0.3 에서 옵션 추가 가치 있음.
+  4. **cli_timeout 파라미터** 는 추가됐으나 workers.py 가 아직 `cursor_timeout`
+     이름으로 전달 — 호환 유지. 향후 phase 별 timeout 분리는 v0.3.
+  5. **_cli_provider 패턴** 은 4번째 CLI (예: ollama-cli, openrouter-cli) 추가 시
+     함수 1개 + 분기 1줄로 확장 — 패턴이 깔끔. 현재 dispatcher 반환은 string,
+     필요 시 enum/Literal 로 강타입화.
+- 학습:
+  - 패턴:
+    - 새 CLI provider 추가 = `_is_X_model` + `_X_model_arg` + `_call_X_cli` +
+      `_cli_provider()` 분기 + cli.py imports + doctor / models 명령 갱신 + tests
+      (cursor 9 tests 패턴 복제). subprocess.run / shutil.which monkeypatch 만
+      stdlib 로 충분.
+    - shutil.which 모킹 시 다른 CLI 가 PATH 에 있는 척 하면 안 됨 — `name=="claude"`
+      처럼 정확 매치 + 그 외 None 반환 패턴이 안전.
+    - claude / gemini 도 cursor 와 같이 prompt+system 을 `# System\n\n<sys>\n\n# Task\n\n<prompt>`
+      로 렌더링. 어떤 CLI 든 system 슬롯이 따로 없으므로 일관성 유지.
+  - 주의사항:
+    - `node --version` 은 gemini 만 의존하지만 claude 도 Node 위에서 도는 npm
+      package 라 둘 다 영향. doctor 에 통합 표시.
+    - claude `--add-dir` 와 gemini `--include-directories` 는 의미는 같지만 flag
+      이름이 달라서 dispatcher 분기 시 명확히 구분.
+    - 이번 e2e 는 1 cycle 자동 stop 으로 끝나 multi-cycle 동작은 검증 안 됨.
+      free-form `run` 명령으로 강제 다중 cycle 검증은 v0.3 stress test 후보.
 ---

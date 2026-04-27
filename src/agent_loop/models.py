@@ -1,11 +1,18 @@
 """Thin litellm wrapper that maps a phase name to a configured model.
 
-Two providers are supported:
+Four provider paths are supported:
   - litellm (default): any `provider/model` recognized by litellm.
-  - cursor-agent CLI: model strings of the form `cursor` or `cursor/<model>`,
+  - cursor-agent CLI: ids of the form `cursor` or `cursor/<model>`,
     invoked via the locally installed `cursor-agent` binary in `--print` mode.
-    The CLI is itself an agent — a single call may use tools, edit files, and
-    take tens of seconds to several minutes.
+  - Claude Code CLI: ids of the form `claude` or `claude/<model>`,
+    invoked via the locally installed `claude` binary in `--print` mode
+    (uses the user's logged-in Anthropic account, no API key needed).
+  - Gemini CLI: ids of the form `gemini` or `gemini/<model>` (e.g.
+    `gemini/gemini-2.5-pro`), invoked via the local `gemini` binary in
+    `-p` headless mode (uses the user's oauth-personal account).
+
+All CLI providers are themselves agents — a single call may use tools,
+edit files, and take tens of seconds to several minutes.
 
 Example:
     from agent_loop.config import load_config
@@ -20,7 +27,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -39,6 +46,22 @@ class ModelResponse:
     cost_usd: float
     latency_s: float
     model: str
+
+
+@dataclass
+class CodeAndContext:
+    code: str
+    task: str
+    plan: str
+    findings: str
+    execution_log: str
+
+
+@dataclass
+class CodeAnalysis:
+    summary: str
+    issues: list[str] = field(default_factory=list)
+    suggestions: list[str] = field(default_factory=list)
 
 
 def _model_for_phase(phase: Phase, cfg: Config) -> str:
@@ -183,6 +206,215 @@ def _call_cursor_cli(
 
 
 # ---------------------------------------------------------------------------
+# Claude Code CLI provider
+# ---------------------------------------------------------------------------
+
+def _is_claude_model(model: str) -> bool:
+    if not model:
+        return False
+    return model == "claude" or model.startswith("claude/")
+
+
+def _claude_model_arg(model: str) -> str:
+    """Translate a config string like `claude/default` into the model name.
+
+    Claude Code CLI does not currently expose a `--model` flag from the wrapper —
+    it picks model based on its settings. We retain the suffix for forward
+    compatibility (v0.3+ may pass it via env or settings); for now it is purely
+    informational and surfaced in the ModelResponse.model field.
+    """
+    if model == "claude":
+        return "default"
+    return model.split("/", 1)[1] if "/" in model else "default"
+
+
+def _call_claude_cli(
+    prompt: str,
+    system: str = "",
+    *,
+    model: str = "default",
+    workspace: Path | str | None = None,
+    timeout: float = 600.0,
+) -> ModelResponse:
+    """Invoke the local `claude` CLI (Claude Code) in non-interactive mode.
+
+    Uses ``--print --output-format text --dangerously-skip-permissions --bare``.
+    The ``--bare`` flag isolates the spawned Claude Code from user plugins,
+    hooks, and CLAUDE.md context for predictable behavior; ``--add-dir`` brings
+    the workspace into reach.
+
+    The user's Claude Code login is reused — no API key required.
+    cost_usd is reported as 0 because subscription billing is opaque.
+    """
+    cli = shutil.which("claude")
+    if cli is None:
+        raise RuntimeError(
+            "claude CLI not found on PATH. "
+            "Install Claude Code from https://claude.com/code or run `claude` once to log in."
+        )
+
+    rendered = (
+        f"# System\n\n{system.strip()}\n\n# Task\n\n{prompt.strip()}"
+        if system.strip()
+        else prompt
+    )
+
+    cmd: list[str] = [
+        cli,
+        "--print",
+        "--output-format",
+        "text",
+        "--dangerously-skip-permissions",
+    ]
+    if workspace is not None:
+        cmd.extend(["--add-dir", str(workspace)])
+    cmd.append(rendered)
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"claude CLI timed out after {timeout:.0f}s "
+            f"(model={model}, workspace={workspace})"
+        ) from e
+    latency_s = time.monotonic() - started
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-2000:]
+        raise RuntimeError(
+            f"claude CLI failed (rc={proc.returncode}, model={model}): {stderr_tail}"
+        )
+
+    text = (proc.stdout or "").rstrip("\n")
+    return ModelResponse(
+        text=text,
+        prompt_tokens=max(1, len(rendered) // 4),
+        completion_tokens=max(0, len(text) // 4),
+        cost_usd=0.0,
+        latency_s=latency_s,
+        model=f"claude/{model}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider
+# ---------------------------------------------------------------------------
+
+def _is_gemini_model(model: str) -> bool:
+    if not model:
+        return False
+    return model == "gemini" or model.startswith("gemini/")
+
+
+def _gemini_model_arg(model: str) -> str:
+    """Translate `gemini/gemini-2.5-pro` into the `-m` value (`gemini-2.5-pro`).
+
+    Bare `gemini` defaults to `gemini-2.5-pro`.
+    """
+    if model == "gemini":
+        return "gemini-2.5-pro"
+    return model.split("/", 1)[1] if "/" in model else "gemini-2.5-pro"
+
+
+def _call_gemini_cli(
+    prompt: str,
+    system: str = "",
+    *,
+    model: str = "gemini-2.5-pro",
+    workspace: Path | str | None = None,
+    timeout: float = 600.0,
+) -> ModelResponse:
+    """Invoke the local `gemini` CLI in non-interactive (`-p`) mode.
+
+    Flags: ``-p <prompt> -m <model> --output-format text --yolo --skip-trust``
+    plus ``--include-directories <workspace>`` when provided. Uses the user's
+    oauth-personal account (Google One AI Pro). Requires Node v22+.
+
+    cost_usd is reported as 0 because subscription billing is opaque.
+    """
+    cli = shutil.which("gemini")
+    if cli is None:
+        raise RuntimeError(
+            "gemini CLI not found on PATH. "
+            "Install with `npm install -g @google/gemini-cli` and run `gemini` once to log in."
+        )
+
+    rendered = (
+        f"# System\n\n{system.strip()}\n\n# Task\n\n{prompt.strip()}"
+        if system.strip()
+        else prompt
+    )
+
+    cmd: list[str] = [
+        cli,
+        "-p",
+        rendered,
+        "-m",
+        model,
+        "--output-format",
+        "text",
+        "--yolo",
+        "--skip-trust",
+    ]
+    if workspace is not None:
+        cmd.extend(["--include-directories", str(workspace)])
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"gemini CLI timed out after {timeout:.0f}s "
+            f"(model={model}, workspace={workspace})"
+        ) from e
+    latency_s = time.monotonic() - started
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-2000:]
+        raise RuntimeError(
+            f"gemini CLI failed (rc={proc.returncode}, model={model}): {stderr_tail}"
+        )
+
+    text = (proc.stdout or "").rstrip("\n")
+    return ModelResponse(
+        text=text,
+        prompt_tokens=max(1, len(rendered) // 4),
+        completion_tokens=max(0, len(text) // 4),
+        cost_usd=0.0,
+        latency_s=latency_s,
+        model=f"gemini/{model}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI provider dispatch helper
+# ---------------------------------------------------------------------------
+
+def _cli_provider(model: str) -> str | None:
+    """Return ``"cursor"`` / ``"claude"`` / ``"gemini"`` for CLI-routed models, else None."""
+    if _is_cursor_model(model):
+        return "cursor"
+    if _is_claude_model(model):
+        return "claude"
+    if _is_gemini_model(model):
+        return "gemini"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # litellm provider
 # ---------------------------------------------------------------------------
 
@@ -240,29 +472,53 @@ def call_model(
     extra: dict[str, Any] | None = None,
     workspace: Path | str | None = None,
     cursor_timeout: float = 600.0,
+    cli_timeout: float | None = None,
 ) -> ModelResponse:
     """Invoke the model assigned to `phase` and return a normalized response.
 
-    Routes to the cursor-agent CLI when the configured model starts with
-    ``cursor`` / ``cursor/...``; everything else goes through litellm.
-    Retries once on litellm.RateLimitError with a short backoff.
+    Routes to a local CLI (cursor / claude / gemini) when the configured model
+    id is prefixed with ``cursor`` / ``claude`` / ``gemini``; everything else
+    goes through litellm. Retries once on litellm.RateLimitError with a short
+    backoff.
 
     Extra keyword args:
-      workspace:        Pass-through to cursor-agent ``--workspace``. Ignored
-                        by litellm.
-      cursor_timeout:   Hard subprocess timeout when using cursor-agent.
+      workspace:        Pass-through to the CLI's workspace flag (cursor:
+                        ``--workspace``, claude: ``--add-dir``, gemini:
+                        ``--include-directories``). Ignored by litellm.
+      cursor_timeout:   Legacy alias for cli_timeout (kept for API stability).
+      cli_timeout:      Subprocess timeout (seconds) when routing to a CLI
+                        provider. Defaults to ``cursor_timeout``.
     """
     cfg = config or load_config()
     model = _model_for_phase(phase, cfg)
 
-    if _is_cursor_model(model):
-        return _call_cursor_cli(
-            prompt,
-            system,
-            model=_cursor_model_arg(model),
-            workspace=workspace,
-            timeout=cursor_timeout,
-        )
+    provider = _cli_provider(model)
+    if provider is not None:
+        timeout = cli_timeout if cli_timeout is not None else cursor_timeout
+        if provider == "cursor":
+            return _call_cursor_cli(
+                prompt,
+                system,
+                model=_cursor_model_arg(model),
+                workspace=workspace,
+                timeout=timeout,
+            )
+        if provider == "claude":
+            return _call_claude_cli(
+                prompt,
+                system,
+                model=_claude_model_arg(model),
+                workspace=workspace,
+                timeout=timeout,
+            )
+        if provider == "gemini":
+            return _call_gemini_cli(
+                prompt,
+                system,
+                model=_gemini_model_arg(model),
+                workspace=workspace,
+                timeout=timeout,
+            )
 
     return _call_litellm(
         model,

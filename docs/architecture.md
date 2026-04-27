@@ -32,8 +32,8 @@ components plug in. See `docs/plan-v0.2.md` for design rationale.
                 v         v           v           v
    +----------------+ +-----------+ +-------+ +------------+
    | Model Router  | | Context   | | State | | Verify     |
-   | (litellm |    | | Engine    | | Store | | Engine     |
-   |  cursor)      | | 3-tier    | |       | | (v0.2)     |
+   | litellm +     | | Engine    | | Store | | Engine     |
+   | 3 CLIs        | | 3-tier    | |       | | (v0.2)     |
    | src/.../      | | memory    | |TaskDir| | rubric +   |
    | models.py     | | src/.../  | |       | | evaluators/|
    |               | | context.py| |       | |            |
@@ -41,12 +41,12 @@ components plug in. See `docs/plan-v0.2.md` for design rationale.
            |               |           |           |
            v               v           v           v
    +-----------------+ +-----------+ +--------+ +---------------+
-   | litellm | cursor| | memory/   | |.agent_ | | evaluators/   |
-   | -agent CLI      | |  history  | | loop/  | |  pytest_      |
-   | (subprocess,    | |  .jsonl   | |  <id>/ | |  benchmark    |
-   |  `cursor/<m>`)  | |  episodic | |        | |  ast_grep     |
-   |                 | |  core_    | |        | |  llm_rubric   |
-   |                 | |  facts.md | |        | |               |
+   | litellm + 3 CLI | | memory/   | |.agent_ | | evaluators/   |
+   | adapters:       | |  history  | | loop/  | |  pytest_      |
+   |  cursor/<m>     | |  .jsonl   | |  <id>/ | |  benchmark    |
+   |  claude/<m>     | |  episodic | |        | |  ast_grep     |
+   |  gemini/<m>     | |  core_    | |        | |  llm_rubric   |
+   | (all subprocess)| |  facts.md | |        | |               |
    +-----------------+ +-----------+ +--------+ +---------------+
 ```
 
@@ -61,7 +61,7 @@ orchestrator goes through. Verify Engine in turn dispatches to ``evaluators/*``.
 | `cli.py` | typer CLI surface: `run / list / resume / bench / config / models`. Owns rich console output. | `app` (Typer) |
 | `orchestrator.py` | The R->P->I->V->J loop. Resume from checkpoint, rollback on judge regression, budget guard. | `Orchestrator`, `RunResult` |
 | `workers.py` | One pure function per phase. Reads + writes `TaskDir`, calls the model router. **No state across calls.** | `run_research / run_plan / run_implement / run_verify / run_judge` |
-| `models.py` | Single `call_model(phase, prompt, system, config)` entry point. Routes `cursor/...` model ids to the local `cursor-agent` CLI (`_call_cursor_cli`, subprocess, no API key) and everything else to litellm (`_call_litellm`); tracks tokens / cost / latency; one retry on rate-limit. | `ModelResponse`, `call_model`, `_call_cursor_cli` |
+| `models.py` | Single `call_model(phase, prompt, system, config)` entry point. Dispatches CLI model ids (`cursor/<m>`, `claude/<m>`, `gemini/<m>`) to local subprocess adapters (`_call_cursor_cli` / `_call_claude_cli` / `_call_gemini_cli` — no API key, uses each CLI's own login) via the `_cli_provider()` helper; everything else goes to litellm (`_call_litellm`). Tracks tokens / cost / latency; one retry on rate-limit. | `ModelResponse`, `call_model`, `_call_cursor_cli`, `_call_claude_cli`, `_call_gemini_cli` |
 | `context.py` | v0.2 Context Engine. Owns the 3-tier `memory/` layout (`history.jsonl` + `episodic.md` + `core_facts.md`), rule-based Compactor, and sensor heuristics (`duplicate_ratio`, `contradiction_count`, `staleness_age_cycles`, `relevance_score`). Migrates v0.1 `memory.txt` once. No LLM calls. | `ContextEngine`, `MemorySnapshot` |
 | `verify_engine.py` + `evaluators/*` | v0.2 multi-axis Verify Engine. When a task ships a `rubric.json`, drives axes through `pytest_runner` / `benchmark` / `ast_grep` (ground-truth) and `llm_rubric` (soft fallback). Backward compat: rubric absent -> `_run_verify_llm_legacy`. | `VerifyEngine`, `AxisScore`, `VerifyResult`, `yaml_to_rubric` |
 | `config.py` | TOML loader (file + env override) + pydantic validation. | `Config`, `Models`, `Budget`, `Runtime` |

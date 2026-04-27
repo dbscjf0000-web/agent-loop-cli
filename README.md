@@ -7,11 +7,18 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
-**v0.1.1** — feature-complete MVP, 32 unit tests passing, dry-run end-to-end verified for all
-four reference benchmarks, **and one live end-to-end run executed via the `cursor-agent` CLI
-provider on KISTI Neuron** (1 cycle, judge auto-stop at score 0.973, real `solution.py`
-written). Litellm-backed runs (Anthropic / OpenAI / Gemini / Azure / Ollama) still depend on
-provider API keys and are exercised by mocked tests only.
+**v0.2.1** — three CLI providers (`cursor-agent`, Claude Code `claude`, Google `gemini`) plus
+litellm in one model dispatch table, 77 unit tests passing, and a cross-vendor live
+`bench binary_search` run on KISTI Neuron with the v0.2 Verify Engine and Judge short-circuit
+(weighted_score=1.000, 1 cycle stop, total ~77 s wall clock). Earlier milestones:
+
+- **v0.2** — Context Engine (3-tier memory) + Verify Engine (rubric-driven multi-axis scoring)
+  live-validated on `n_queens` (cursor/auto, weighted_score=1.000).
+- **v0.1.1** — `cursor-agent` provider integration, first live e2e (binary_search, score 0.973).
+- **v0.1.0** — feature-complete MVP, dry-run e2e for all four reference benchmarks.
+
+Litellm-backed runs (Anthropic / OpenAI / Gemini / Azure / Ollama) still depend on provider API
+keys and are exercised by mocked tests only.
 
 See `docs/plan-v0.1.md` for the full spec, `docs/architecture.md` for the layered design, and
 `progress.txt` for build history.
@@ -178,6 +185,59 @@ with first-row symmetry — `n_queens_count(13)` measured at **1.046 s median**
 (N=1..13) passed in the same `pytest` evaluator run. Judge auto-stopped on
 the first cycle because there was no prior best to beat.
 
+### Cross-vendor live e2e (v0.2.1) — three CLI vendors in one run
+
+The v0.2.1 milestone adds two new CLI providers — Claude Code (`claude/<id>`) and
+Google Gemini (`gemini/<id>`) — alongside the existing cursor-agent path.
+A live `bench binary_search` was driven on KISTI Neuron with **three different
+vendors across the five phases**:
+
+```toml
+# /tmp/al_3vendor/config.toml
+[models]
+research  = "cursor/auto"
+plan      = "cursor/auto"
+implement = "cursor/auto"
+verify    = "claude/default"
+judge     = "gemini/gemini-2.5-flash"
+```
+
+```bash
+python3 -m agent_loop.cli bench binary_search \
+    --config /tmp/al_3vendor/config.toml \
+    --root /tmp/al_3vendor/.agent_loop \
+    --cycles 2 --max-redo 1
+```
+
+Result (`task_id=bench-binary_search-06627c`, 1 cycle, `final_status=stop`,
+`weighted_score=1.000`):
+
+| phase           | latency | model                    |
+|-----------------|---------|--------------------------|
+| research        |  25.92s | cursor/auto              |
+| plan            |  39.56s | cursor/auto              |
+| implement       |  11.59s | cursor/auto              |
+| verify          |   0.03s | (verify_engine: rubric)  |
+| judge           |   0.00s | (skipped: first cycle)   |
+| **total**       | **~77 s** |                       |
+
+The ground-truth shortcuts kicked in (rubric short-circuit + first-cycle judge
+auto-stop), so neither claude nor gemini ran on this particular cycle —
+the v0.2 Verify Engine deliberately bypasses the LLM verifier whenever a
+benchmark has `success_criteria`. The provider plumbing was exercised
+independently:
+
+```bash
+agent-loop test-model cursor/auto             # 11.82 s -> 'OK'
+agent-loop test-model claude/default          # 10.27 s -> 'OK'
+agent-loop test-model gemini/gemini-2.5-flash #  8.19 s -> 'OK'
+```
+
+Use this preset on tasks without a YAML rubric (e.g. `agent-loop run "..."` for a
+free-form prompt) to actually drive claude through legacy LLM verify and gemini
+through the second-cycle judge. Note that `claude --print` is itself agentic
+and can take several minutes per call; bump `cli_timeout` if needed.
+
 ## Configuration
 
 Default location: `~/.agent-loop/config.toml`. Override with `./agent-loop.toml` (project-local)
@@ -224,10 +284,12 @@ max_redo   = 3
 |---|---|---|
 | Anthropic | `ANTHROPIC_API_KEY` | research / plan / implement / verify |
 | OpenAI | `OPENAI_API_KEY` | judge |
-| Gemini | `GEMINI_API_KEY` | (any phase if mapped) |
+| Gemini (API) | `GEMINI_API_KEY` | (any phase if mapped) |
 | Azure OpenAI | `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION` | (any phase if mapped via `azure/...`) |
 | Local Ollama | (no key) | set models to `ollama/<name>` |
 | **Cursor (CLI)** | (no key — `cursor-agent login` once) | set models to `cursor/<id>` |
+| **Claude Code (CLI)** | (no key — run `claude` once to log in) | set models to `claude/<id>` |
+| **Gemini (CLI)** | (no key — run `gemini` once to OAuth) | set models to `gemini/<id>` |
 
 #### Cursor (CLI)
 
@@ -253,6 +315,37 @@ judge     = "cursor/auto"
 `cost_usd` is reported as `0.0` for cursor models (Pro subscription assumed); token
 counts are rough char/4 estimates. List candidate model names with `agent-loop models`
 or `cursor-agent --list-models`.
+
+#### Claude Code CLI
+
+Models prefixed with `claude` (e.g. `claude/default`) delegate to a locally installed
+[`claude`](https://claude.com/code) CLI in `--print` mode. Like cursor-agent it is itself
+an agent — a single phase call may run tools and edit files. Authentication uses the
+user's existing Claude Code login (no API key needed). The wrapper passes
+`--dangerously-skip-permissions` (sandbox-only) and `--add-dir <workspace>`.
+
+```bash
+claude                              # one-time, browser-based login
+agent-loop doctor                   # confirms PATH + version
+agent-loop test-model claude/default   # 'OK' ping (~10 s)
+```
+
+#### Gemini CLI
+
+Models prefixed with `gemini` (e.g. `gemini/gemini-2.5-pro`, `gemini/gemini-2.5-flash`)
+delegate to the locally installed [`gemini`](https://github.com/google-gemini/gemini-cli)
+CLI in `-p` headless mode (`--yolo --skip-trust --include-directories <workspace>`).
+Authentication uses the user's `oauth-personal` Google login (Google One AI Pro).
+Gemini CLI requires Node v22+.
+
+```bash
+gemini                              # one-time, OAuth-personal login
+agent-loop doctor                   # confirms PATH + version + node v22+
+agent-loop test-model gemini/gemini-2.5-flash   # 'OK' ping (~8 s; pro can be 1+ min cold start)
+```
+
+> Note: `gemini-2.5-pro` cold-start can exceed 60 s. Use `flash` for ping/judge and
+> bump `cli_timeout` for `pro` if you map it to long-running phases.
 
 ### Multi-model setup (cross-vendor judge)
 
@@ -285,6 +378,19 @@ plan      = "cursor/auto"
 implement = "cursor/auto"
 verify    = "cursor/auto"
 judge     = "cursor/auto"
+
+# All-CLI cross-vendor preset (v0.2.1): every phase ends in a different vendor's
+# CLI. Build phases use cursor (fast cycle), verify uses Claude Code, judge uses
+# Gemini Flash. No API keys needed — only logged-in CLIs. When a benchmark has
+# `success_criteria` in YAML the v0.2 Verify Engine auto-generates `rubric.json`
+# and the verify phase short-circuits the LLM call (claude is invoked only on
+# tasks without a rubric).
+[models]
+research  = "cursor/auto"
+plan      = "cursor/auto"
+implement = "cursor/auto"
+verify    = "claude/default"
+judge     = "gemini/gemini-2.5-flash"
 ```
 
 ## State directory layout

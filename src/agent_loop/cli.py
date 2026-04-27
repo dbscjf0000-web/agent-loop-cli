@@ -36,7 +36,20 @@ from agent_loop.config import (
     load_config,
     _DEFAULT_TOML,
 )
-from agent_loop.models import ModelResponse, _call_cursor_cli, _call_litellm, _is_cursor_model, _cursor_model_arg
+from agent_loop.models import (
+    ModelResponse,
+    _call_claude_cli,
+    _call_cursor_cli,
+    _call_gemini_cli,
+    _call_litellm,
+    _claude_model_arg,
+    _cli_provider,
+    _cursor_model_arg,
+    _gemini_model_arg,
+    _is_claude_model,
+    _is_cursor_model,
+    _is_gemini_model,
+)
 from agent_loop.orchestrator import Orchestrator
 from agent_loop.state import TaskDir, list_tasks, new_task_id
 
@@ -227,6 +240,8 @@ def cmd_bench(
 # models
 # ---------------------------------------------------------------------------
 _KNOWN_CURSOR_MODELS = ("auto", "sonnet-4", "sonnet-4-thinking", "gpt-5")
+_KNOWN_CLAUDE_MODELS = ("default",)
+_KNOWN_GEMINI_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash")
 
 
 def _list_cursor_models() -> list[str]:
@@ -249,6 +264,21 @@ def _list_cursor_models() -> list[str]:
     return list(_KNOWN_CURSOR_MODELS)
 
 
+def _list_claude_models() -> list[str]:
+    """Static list. Claude Code CLI does not expose --list-models; the user
+    selects model via settings/--model, but our adapter currently uses default."""
+    if shutil.which("claude") is None:
+        return []
+    return list(_KNOWN_CLAUDE_MODELS)
+
+
+def _list_gemini_models() -> list[str]:
+    """Static list. Gemini CLI does not expose a list endpoint."""
+    if shutil.which("gemini") is None:
+        return []
+    return list(_KNOWN_GEMINI_MODELS)
+
+
 @app.command("models")
 def cmd_models(
     config_path: Optional[Path] = typer.Option(None, "--config"),
@@ -269,6 +299,22 @@ def cmd_models(
         for m in cursor_models:
             ct.add_row(m)
         console.print(ct)
+
+    claude_models = _list_claude_models()
+    if claude_models:
+        clt = Table(title="claude (Claude Code) models (use as claude/<model>)")
+        clt.add_column("model", style="green")
+        for m in claude_models:
+            clt.add_row(m)
+        console.print(clt)
+
+    gemini_models = _list_gemini_models()
+    if gemini_models:
+        gt = Table(title="gemini models (use as gemini/<model>)")
+        gt.add_column("model", style="green")
+        for m in gemini_models:
+            gt.add_row(m)
+        console.print(gt)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +398,103 @@ def cmd_doctor(
             "install cursor-agent + run `cursor-agent login`",
         )
 
+    # claude (Claude Code CLI)
+    claude_path = shutil.which("claude")
+    if claude_path:
+        table.add_row("claude: PATH", "[green]OK[/green]", claude_path)
+        try:
+            s = subprocess.run(
+                [claude_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if s.returncode == 0:
+                first = (s.stdout or s.stderr).strip().splitlines()
+                table.add_row(
+                    "claude: version",
+                    "[green]OK[/green]",
+                    first[0][:200] if first else "ok",
+                )
+            else:
+                table.add_row(
+                    "claude: version",
+                    "[red]FAIL[/red]",
+                    f"rc={s.returncode}: {(s.stderr or s.stdout).strip()[:200]}",
+                )
+        except Exception as e:
+            table.add_row("claude: version", "[red]FAIL[/red]", str(e)[:200])
+    else:
+        table.add_row(
+            "claude: PATH",
+            "[yellow]missing[/yellow]",
+            "install Claude Code CLI + run `claude` once to log in",
+        )
+
+    # gemini
+    gemini_path = shutil.which("gemini")
+    if gemini_path:
+        table.add_row("gemini: PATH", "[green]OK[/green]", gemini_path)
+        try:
+            s = subprocess.run(
+                [gemini_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if s.returncode == 0:
+                first = (s.stdout or s.stderr).strip().splitlines()
+                table.add_row(
+                    "gemini: version",
+                    "[green]OK[/green]",
+                    first[0][:200] if first else "ok",
+                )
+            else:
+                table.add_row(
+                    "gemini: version",
+                    "[red]FAIL[/red]",
+                    f"rc={s.returncode}: {(s.stderr or s.stdout).strip()[:200]}",
+                )
+        except Exception as e:
+            table.add_row("gemini: version", "[red]FAIL[/red]", str(e)[:200])
+    else:
+        table.add_row(
+            "gemini: PATH",
+            "[yellow]missing[/yellow]",
+            "npm install -g @google/gemini-cli + run `gemini` once to log in",
+        )
+
+    # node (gemini requires v22+)
+    node_path = shutil.which("node")
+    if node_path:
+        try:
+            s = subprocess.run(
+                [node_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            ver = (s.stdout or s.stderr).strip().splitlines()[0] if s.stdout or s.stderr else ""
+            # parse major: "v22.22.2" -> 22
+            major = 0
+            try:
+                major = int(ver.lstrip("v").split(".", 1)[0])
+            except Exception:
+                pass
+            ok = major >= 22
+            table.add_row(
+                "node",
+                "[green]OK[/green]" if ok else "[yellow]old[/yellow]",
+                f"{ver}{' (gemini requires >=22)' if not ok else ''}",
+            )
+        except Exception as e:
+            table.add_row("node", "[red]FAIL[/red]", str(e)[:200])
+    else:
+        table.add_row("node", "[yellow]missing[/yellow]", "gemini CLI requires Node v22+")
+
     # litellm version
     try:
         import litellm
@@ -373,18 +516,35 @@ def cmd_doctor(
 # ---------------------------------------------------------------------------
 @app.command("test-model")
 def cmd_test_model(
-    model_id: str = typer.Argument(..., help="Model id (e.g. 'cursor/auto', 'anthropic/claude-haiku-4-5')."),
-    timeout: int = typer.Option(120, "--timeout", help="Cursor-agent timeout (seconds)."),
+    model_id: str = typer.Argument(..., help="Model id (e.g. 'cursor/auto', 'claude/default', 'gemini/gemini-2.5-pro', 'anthropic/claude-haiku-4-5')."),
+    timeout: int = typer.Option(120, "--timeout", help="CLI provider timeout (seconds)."),
 ) -> None:
     """Send a short 'Reply with OK' ping to the given model and print the result."""
     prompt = "Reply with the single word: OK"
     console.print(f"[cyan]>[/cyan] pinging [magenta]{model_id}[/magenta] ...")
     try:
-        if _is_cursor_model(model_id):
+        provider = _cli_provider(model_id)
+        if provider == "cursor":
             resp = _call_cursor_cli(
                 prompt,
                 system="",
                 model=_cursor_model_arg(model_id),
+                workspace=None,
+                timeout=float(timeout),
+            )
+        elif provider == "claude":
+            resp = _call_claude_cli(
+                prompt,
+                system="",
+                model=_claude_model_arg(model_id),
+                workspace=None,
+                timeout=float(timeout),
+            )
+        elif provider == "gemini":
+            resp = _call_gemini_cli(
+                prompt,
+                system="",
+                model=_gemini_model_arg(model_id),
                 workspace=None,
                 timeout=float(timeout),
             )
