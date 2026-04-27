@@ -28,3 +28,44 @@ agent-loop bench --quick          # only easy tasks (binary_search)
 1. Create `benchmarks/<name>.yaml` (follow same schema)
 2. Add row to the table above
 3. (Optional) Add reference solution in `benchmarks/_reference/<name>.py`
+
+## Quantitative comparison (`compare.py`)
+
+`compare.py` runs each task twice — once via a single `cursor-agent` call
+(`baseline_runner.py`) and once via the full R→P→I→V→J cycle — and scores
+both with the same `VerifyEngine` so the result is apples-to-apples.
+
+```bash
+module load python/3.12.4
+
+# Pin every loop phase to cursor so both sides hit the same provider.
+cat > /tmp/al_compare_config.toml <<'EOF'
+[models]
+research  = "cursor/auto"
+plan      = "cursor/auto"
+implement = "cursor/auto"
+verify    = "cursor/auto"
+judge     = "cursor/auto"
+
+[runtime]
+cli_timeout = 240
+EOF
+
+python3 benchmarks/compare.py \
+    --tasks binary_search,n_queens,palindrome,sort_tuning \
+    --runs 2 \
+    --output /tmp/al_compare.csv \
+    --loop-config /tmp/al_compare_config.toml \
+    --baseline-timeout 90 \
+    --loop-timeout 300
+```
+
+Outputs:
+
+- `<output>` — long-form CSV, one row per (task, method, run_id).
+- `<output>.summary.json` — per-task mean / stddev / min / max / pass-rate.
+- Console — Markdown-style summary table.
+
+Failed runs (timeouts, missing fenced block, evaluator crash) are kept in
+the statistics with `weighted_score = 0.0`. See the README's
+"Quantitative comparison (v0.5.1)" section for the headline numbers.

@@ -1,4 +1,5 @@
 ## Codebase Patterns (최상단 고정)
+- 정량 비교는 `benchmarks/compare.py` (baseline=cursor 1-shot vs agent-loop 5-phase, 동일 VerifyEngine 채점). `benchmarks/baseline_runner.py` 가 `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출 후 fenced ```python``` 추출. compare.py 는 `--loop-config` 로 cursor 모든 phase 강제해서 apples-to-apples. 결과 CSV `/tmp/al_compare.csv`, summary JSON `/tmp/al_compare.summary.json`. v0.5.1 1-cycle 기준: n_queens 만 agent-loop 가 baseline 대비 +0.12 점 우위 (perf gate 1.5s 통과 vs baseline 0.76 부분점수); binary_search/palindrome/sort_tuning 는 동점 (1-cycle 한계 — 더 어려운 task 는 cycles>=2 + redo 필요). agent-loop 시간 비용 baseline 의 ~4 배 (70s vs 15s).
 - v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
 - 진짜 cross-vendor verify 증명 (2026-04-27): free-form `agent-loop run` (rubric 없음) + cursor→gemini-2.5-flash 조합으로 verify가 실제 LLM 호출됨 (15.25s, 한국어 evidence). 단 judge는 first cycle 에서 자동 skip ("no prior best") — 다중 vendor judge 증명은 score<1.0 task 필요. claude/default 는 free-form verify 에서 600s timeout 재현됨.
 - v0.3 multi-judge + multi-strategy + judge_always_llm 라이브 cross-vendor 검증 통과 (2026-04-27, task_id=9380cc): 3 strategies(cursor/gemini/claude) + 3 judges(동일) 1 cycle 동시 실행 — proposals.json 3개(cursor 1465ch / gemini 2232ch / claude timeout), plan_selector.json `selector_method="heuristic+llm"` winner=gemini-flash (LLM rationale="claude has no usable plan"), plan.md == winner.text byte-identical. judge_result.json `n_judges=3`, `votes_action={"stop":2.0}`, `votes_better={"true":2.0}`, individual 3개(cursor 13s/gemini 34s OK, claude 600s timeout), `fallback=false`. judge_always_llm=true 효과 증명: best=null 인 cycle 1 에서도 cursor/gemini 둘 다 latency_s>0 + reason 텍스트 = 진짜 LLM call. metrics.jsonl plan/judge row 에 `n_strategies`, `n_judges`, `winner_provider`, `consensus_fallback` 모두 정확 기록. 발견 한계: `claude --print` 는 plan/judge prompt 도 600s timeout 재현 (verify 만 아님) — multi-vendor 합의 시 claude leg 은 surviving 2 vendor 로 graceful degrade.
@@ -1479,4 +1480,44 @@
     반드시 stderr (또는 file=open(devnull)) 로 묶어야 함 — agent-loop 만의
     문제가 아니라 **모든 LLM CLI 가 MCP stdio mode 출시 시 첫번째로 검증할
     포인트**.
+---
+
+## [2026-04-28 00:55] - Quantitative compare: cursor 1-shot vs agent-loop 5-phase
+- 구현:
+  - `benchmarks/baseline_runner.py` — `run_baseline(task_text, workspace, *, timeout, model)` (~150 lines).
+    `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출,
+    fenced ```python``` 블록만 추출 후 `solution.py` 로 저장. timeout/실패도 dict 로 기록 (raise 안 함).
+  - `benchmarks/compare.py` — `score_solution(yaml, ws)` + `run_baseline_once` + `run_agent_loop_once`
+    + `run_comparison(yaml, runs)` + `summarize` + CSV writer + main() (~340 lines).
+    score_solution 은 임시 TaskDir 만들어서 workspace/solution.py 를 workspace_path() 하위로 복사 →
+    VerifyEngine.evaluate(rubric, llm_fallback=False) 로 ground-truth axes 만 채점.
+  - `--loop-config /tmp/al_compare_config.toml` 로 cursor 모든 5 phase 강제 (default 는 anthropic 이라
+    bench 가 ANTHROPIC_API_KEY 없으면 즉시 실패함 — 디버깅 함정).
+- 변경 파일:
+  - benchmarks/baseline_runner.py (NEW)
+  - benchmarks/compare.py (NEW)
+  - benchmarks/README.md (compare.py 사용법 + config 예제 추가)
+  - README.md (Benchmarks 섹션에 "Quantitative comparison (v0.5.1)" 표 + per-axis findings + verdict + 한계)
+- 상태: 완료
+- 결과 (n=2 per cell, 4 tasks, KISTI Neuron, total wall=12 min):
+  - binary_search:  baseline 1.00 (13s) vs agent-loop 1.00 (60s) — 동점
+  - n_queens:       baseline 0.88 (15s) vs agent-loop 1.00 (71s) — agent-loop +0.12 (perf gate 1.5s 통과)
+  - palindrome:     baseline 0.70 (15s) vs agent-loop 0.70 (68s) — 동점 (둘 다 2000-char 1.0s gate fail)
+  - sort_tuning:    baseline 0.60 (22s) vs agent-loop 0.60 (82s) — 동점 (둘 다 0.9× sorted() ratio fail)
+- 다음 할 일:
+  - cycles>=2 + max-redo>=1 로 재실행해서 palindrome (Manacher 로 pivot 가능?) / sort_tuning
+    (Timsort 못 이김 — task 자체 재설계?) 의 cycles 효과 검증.
+  - gemini/claude vendor 로도 baseline 측정 (현재 cursor only).
+  - n=3+ 로 stddev 신뢰구간 좁히기.
+- 학습:
+  - 패턴: "1 cycle 만으로는 단순 task (binary_search) + perf-easy task (n_queens) 만 차이 나옴.
+    palindrome / sort_tuning 처럼 **알고리즘 pivot 이 필요한** task 는 cycles>=2 가 본질적".
+  - 패턴: "정량 비교 = baseline 단일 호출 + agent-loop 5-phase, 둘 다 동일 VerifyEngine 으로 채점.
+    bench 는 yaml 의 success_criteria → yaml_to_rubric → ground-truth evaluators (pytest+benchmark+ast_grep) 만
+    사용해야 cross-method fairness 보장 (llm_rubric 은 noise 도입)."
+  - 주의사항: `compare.py` 가 `python3 -m agent_loop.cli bench` 를 subprocess 로 부를 때 `--config`
+    안 넘기면 default config (anthropic) 로 빠지므로 KISTI 처럼 ANTHROPIC_API_KEY 없는 환경에선
+    즉시 AuthenticationError. `--loop-config` 로 cursor toml 강제 필요.
+  - 주의사항: TaskDir 이 init() 시 path/workspace/ 를 만드므로 compare 의 score_solution shim 이
+    solution.py 를 path/ 가 아니라 path/workspace/ 에 두도록 copy 해줘야 evaluators 가 찾음.
 ---

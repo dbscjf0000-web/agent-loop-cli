@@ -1302,6 +1302,79 @@ python3 -m agent_loop.cli bench n_queens \
 
 Each yaml declares its own `budget.max_cycles` / `max_redo` / `max_usd`; CLI flags override.
 
+### Quantitative comparison (v0.5.1)
+
+We measure what the 5-phase loop actually buys over a single shot. Both methods
+hit the same `cursor-agent` CLI with the same model (`cursor/auto`); both are
+scored by the same `VerifyEngine` (same rubric, same evaluators), so the
+comparison is apples-to-apples.
+
+**Setup.** `benchmarks/baseline_runner.py` calls `cursor-agent --print
+--output-format text --force --trust --workspace=<ws> "<prompt>"` once and
+extracts a fenced ```python``` block into `solution.py`. `benchmarks/compare.py`
+runs each (task, method) pair `--runs` times and feeds every resulting
+`solution.py` to the same `VerifyEngine.evaluate(rubric, llm_fallback=False)`
+so only ground-truth evaluators (pytest / benchmark / ast_grep) score the run.
+Failed runs (timeouts, parse errors, crashes) are recorded as `score=0.0` and
+kept in the statistics.
+
+**Run** (one full cursor cycle vs one full R/P/I/V/J cycle, both `--cycles 1`):
+
+```bash
+module load python/3.12.4
+python3 benchmarks/compare.py \
+    --tasks binary_search,n_queens,palindrome,sort_tuning \
+    --runs 2 \
+    --output /tmp/al_compare.csv \
+    --loop-config /tmp/al_compare_config.toml \
+    --baseline-timeout 90 --loop-timeout 300
+```
+
+**Results** (KISTI Neuron, n=2 per cell, total wall=12 min):
+
+| Task            | Baseline μ ± σ (latency) | Agent-loop μ ± σ (latency) | Δ score | Δ time |
+|-----------------|--------------------------|----------------------------|---------|--------|
+| `binary_search` | 1.00 ± 0.00 (13 s)       | 1.00 ± 0.00 (60 s)         | +0.00   | +361 % |
+| `n_queens`      | 0.88 ± 0.00 (15 s)       | **1.00 ± 0.00** (71 s)     | +0.12   | +386 % |
+| `palindrome`    | 0.70 ± 0.00 (15 s)       | 0.70 ± 0.00 (68 s)         | +0.00   | +367 % |
+| `sort_tuning`   | 0.60 ± 0.00 (22 s)       | 0.60 ± 0.00 (82 s)         | +0.00   | +278 % |
+
+**Per-axis findings** (raw CSV at `/tmp/al_compare.csv`):
+
+- **`binary_search`** — both methods hit `correctness=1.00` (10/10 asserts) and
+  `complexity=1.00` (`for `≤1, no `.index(`). Trivial task, one-shot is enough.
+- **`n_queens`** — `correctness=1.00` for both. The win is on `performance`:
+  baseline median = ~2.7 s (linear partial drop, score 0.76), agent-loop = ~1.0 s
+  (under the 1.5 s threshold, score 1.00). The 5-phase loop produced a
+  bitmask-based backtracking solution; baseline produced a textbook recursive
+  backtracker that misses the perf gate.
+- **`palindrome`** — both correct on edge cases (8/8 asserts), both fail the
+  2000-char ≤ 1.0 s wall-clock gate. The single cycle of the agent-loop wasn't
+  enough to pivot to Manacher; would need `--cycles ≥ 2` with a redo budget.
+- **`sort_tuning`** — both correct, both fail the `≤ 0.9 × sorted()` ratio gate
+  (CPython's Timsort is already optimal on 95 %-sorted input). One cycle can't
+  beat a built-in.
+
+**Verdict.**
+
+| | when to prefer |
+|---|---|
+| **Baseline (1 cursor call)** | Trivial / well-defined tasks, score ≥ baseline already. ~4× faster, $0 incremental. |
+| **Agent-loop (R→P→I→V→J)** | Tasks with a non-trivial **performance gate** the LLM might miss on the first try (n_queens). Verify catches the failed gate; subsequent cycles iterate. Also necessary when you want a **typed verification report** (axis-by-axis, ground-truth) rather than just code. |
+
+**Where 1 cycle isn't enough.** `palindrome` and `sort_tuning` show the limit
+of a single R/P/I/V/J pass: the engine correctly diagnosed `performance=0` but
+had no redo budget to fix it. Re-running with `--cycles 3 --max-redo 2` is the
+expected operating mode for harder tasks; this comparison deliberately uses
+`--cycles 1` to isolate the value of *the loop structure itself* from the
+value of *iteration*.
+
+**Limits of this study.** (a) cursor-agent only — gemini / claude not measured
+(35-minute live budget). (b) n=2 per cell — enough to bracket variance for these
+deterministic-ish CLIs but not enough for tight CIs. (c) Single cycle for the
+loop method — agent-loop's value-add on `palindrome` / `sort_tuning` only
+appears past cycle 1. (d) No token / cost axis (cursor Pro = $0 metering).
+
 ## Migration from `agent-loop-plugin`
 
 | | `agent-loop-plugin` (Skill) | `agent-loop-cli` (this repo) |
