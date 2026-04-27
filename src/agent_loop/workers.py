@@ -501,9 +501,16 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
 
 
 def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
-    """v0.1/v0.2 body: one LLM judge call. Preserved verbatim for backward compat."""
-    if not task_dir.has_artifact("best_solution.json"):
-        # First cycle: nothing to compare against.
+    """v0.1/v0.2 body: one LLM judge call. Preserved verbatim for backward compat.
+
+    The first-cycle short-circuit (no LLM call when there is no prior best)
+    can be disabled by setting ``runtime.judge_always_llm = True``. In that
+    mode, the LLM is invoked even on cycle 1 with an empty ``best_solution``
+    payload, which is required for genuine multi-judge cross-vendor
+    verification when the verifier returns score>=0.95 on cycle 1.
+    """
+    if not task_dir.has_artifact("best_solution.json") and not config.runtime.judge_always_llm:
+        # First cycle: nothing to compare against (and short-circuit not disabled).
         sol = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
         # weighted_score is the v0.2 canonical field; v0.1 wrote `score` only.
         score = (
@@ -541,7 +548,13 @@ def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir)
     sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
-    best_obj = task_dir.read_artifact("best_solution.json")
+    # judge_always_llm + first cycle: no prior best yet. Pass an empty stub so
+    # the prompt is still well-formed and the LLM is genuinely invoked.
+    best_obj = (
+        task_dir.read_artifact("best_solution.json")
+        if task_dir.has_artifact("best_solution.json")
+        else {}
+    )
     sol_str = json.dumps(sol_obj, indent=2, ensure_ascii=False)
     best_str = json.dumps(best_obj, indent=2, ensure_ascii=False)
 
@@ -597,8 +610,13 @@ def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     when there is no prior best to compare against). All-judges-fail also
     falls back to single, with the resulting ``judge_result.json`` annotated
     with ``consensus.fallback = True``.
+
+    When ``runtime.judge_always_llm`` is True, the first-cycle short-circuit
+    is disabled and the multi-judge fan-out runs even on cycle 1 with an
+    empty ``best_solution`` stub — required for genuine cross-vendor
+    multi-judge verification on cycle 1.
     """
-    if not task_dir.has_artifact("best_solution.json"):
+    if not task_dir.has_artifact("best_solution.json") and not config.runtime.judge_always_llm:
         return _run_judge_single(task_dir, config)
 
     # Late import: keeps workers.py importable even if judge_engine has issues.
@@ -611,7 +629,12 @@ def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir)
     sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
-    best_obj = task_dir.read_artifact("best_solution.json")
+    # First cycle + judge_always_llm: best_solution.json may not exist yet.
+    best_obj = (
+        task_dir.read_artifact("best_solution.json")
+        if task_dir.has_artifact("best_solution.json")
+        else {}
+    )
     sol_str = json.dumps(sol_obj, indent=2, ensure_ascii=False)
     best_str = json.dumps(best_obj, indent=2, ensure_ascii=False)
 

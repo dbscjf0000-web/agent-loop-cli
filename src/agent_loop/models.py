@@ -485,16 +485,27 @@ def call_model(
       workspace:        Pass-through to the CLI's workspace flag (cursor:
                         ``--workspace``, claude: ``--add-dir``, gemini:
                         ``--include-directories``). Ignored by litellm.
-      cursor_timeout:   Legacy alias for cli_timeout (kept for API stability).
+      cursor_timeout:   Legacy alias for cli_timeout (kept for API stability,
+                        used only when the phase-specific config timeout is
+                        the built-in default of 600 s).
       cli_timeout:      Subprocess timeout (seconds) when routing to a CLI
-                        provider. Defaults to ``cursor_timeout``.
+                        provider. When ``None`` (the default) the value is
+                        taken from ``config.runtime.cli_timeout_for(phase)``,
+                        which honors per-phase overrides set via TOML or env.
     """
     cfg = config or load_config()
     model = _model_for_phase(phase, cfg)
 
     provider = _cli_provider(model)
     if provider is not None:
-        timeout = cli_timeout if cli_timeout is not None else cursor_timeout
+        if cli_timeout is not None:
+            timeout = cli_timeout
+        else:
+            # Phase-aware default from config. cursor_timeout is honored as a
+            # legacy override only when the user did not customize the phase
+            # timeout (i.e. it still equals the built-in 600 s default).
+            phase_to = cfg.runtime.cli_timeout_for(phase)
+            timeout = float(phase_to) if phase_to != 600 else float(cursor_timeout)
         if provider == "cursor":
             return _call_cursor_cli(
                 prompt,

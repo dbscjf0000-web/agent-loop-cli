@@ -534,6 +534,17 @@ per_run_usd = 2
 sandbox    = true
 max_cycles = 10
 max_redo   = 3
+
+# v0.3.1 — CLI subprocess timeout (seconds). `cli_timeout` is the default
+# applied to every phase. Per-phase overrides win when set.
+cli_timeout         = 600
+cli_timeout_verify  = 900   # claude --print verify can saturate at 600 s
+cli_timeout_judge   = 180
+
+# v0.3.1 — disable the judge first-cycle short-circuit. Required for genuine
+# multi-judge cross-vendor verification when verify_score>=0.95 on cycle 1
+# (otherwise the judge auto-stops without ever invoking the LLM).
+judge_always_llm    = false
 ```
 
 ### Environment variables
@@ -552,6 +563,35 @@ max_redo   = 3
 | `AGENT_LOOP_RUNTIME_MAX_REDO` | `[runtime].max_redo` | int |
 | `AGENT_LOOP_RUNTIME_JUDGES` | `[runtime].judges` (v0.3) | comma-separated providers (weight=1.0 each) |
 | `AGENT_LOOP_RUNTIME_STRATEGIES` | `[runtime].strategies` (v0.3) | comma-separated providers (weight=1.0 each) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT` | `[runtime].cli_timeout` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT_RESEARCH` | `[runtime].cli_timeout_research` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT_PLAN` | `[runtime].cli_timeout_plan` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT_IMPLEMENT` | `[runtime].cli_timeout_implement` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT_VERIFY` | `[runtime].cli_timeout_verify` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_CLI_TIMEOUT_JUDGE` | `[runtime].cli_timeout_judge` (v0.3.1) | int (seconds) |
+| `AGENT_LOOP_RUNTIME_JUDGE_ALWAYS_LLM` | `[runtime].judge_always_llm` (v0.3.1) | bool |
+
+#### v0.3.1 CLI flags
+
+`agent-loop run` and `agent-loop bench` accept the following overrides
+(applied on top of file/env config):
+
+| Flag | Maps to | Notes |
+|---|---|---|
+| `--cli-timeout <int>` | `runtime.cli_timeout` | default for every phase |
+| `--cli-timeout-verify <int>` | `runtime.cli_timeout_verify` | per-phase, wins over default |
+| `--cli-timeout-judge <int>` | `runtime.cli_timeout_judge` | per-phase, wins over default |
+| `--judge-always-llm` | `runtime.judge_always_llm` | flag, no value |
+
+Example — relax verify timeout to 900 s and force the judge to run on
+cycle 1 (multi-judge cross-vendor verification):
+
+```bash
+agent-loop run "is_palindrome free-form" \
+  --cli-timeout-verify 900 \
+  --judge-always-llm \
+  --judge claude/default --judge gemini/gemini-2.5-flash
+```
 
 ### Provider credentials
 

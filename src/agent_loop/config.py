@@ -13,6 +13,13 @@ Environment variables can override individual fields:
   AGENT_LOOP_RUNTIME_SANDBOX, AGENT_LOOP_RUNTIME_MAX_CYCLES, AGENT_LOOP_RUNTIME_MAX_REDO
   AGENT_LOOP_RUNTIME_JUDGES        (v0.3, comma-sep providers, weight=1.0 each)
   AGENT_LOOP_RUNTIME_STRATEGIES    (v0.3, comma-sep providers, weight=1.0 each)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT             (v0.3.1, default subprocess timeout — seconds)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT_RESEARCH    (v0.3.1, per-phase override)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT_PLAN        (v0.3.1, per-phase override)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT_IMPLEMENT   (v0.3.1, per-phase override)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT_VERIFY      (v0.3.1, per-phase override)
+  AGENT_LOOP_RUNTIME_CLI_TIMEOUT_JUDGE       (v0.3.1, per-phase override)
+  AGENT_LOOP_RUNTIME_JUDGE_ALWAYS_LLM        (v0.3.1, bool — disable first-cycle short-circuit)
 """
 from __future__ import annotations
 
@@ -82,6 +89,37 @@ class Runtime(BaseModel):
     judges: list[JudgeSpec] | None = None
     # v0.3 multi-strategy plan fan-out. None / empty list -> single-plan mode.
     strategies: list[StrategySpec] | None = None
+
+    # v0.3.1 — subprocess timeout (seconds) for CLI providers. ``cli_timeout``
+    # is the default applied to every phase; a per-phase override (e.g.
+    # ``cli_timeout_verify``) takes precedence when set. ``None`` means "use
+    # the default". See :py:meth:`Runtime.cli_timeout_for`.
+    cli_timeout: int = 600
+    cli_timeout_research: int | None = None
+    cli_timeout_plan: int | None = None
+    cli_timeout_implement: int | None = None
+    cli_timeout_verify: int | None = None
+    cli_timeout_judge: int | None = None
+
+    # v0.3.1 — when True, disable the judge's first-cycle short-circuit and
+    # invoke the LLM (or multi-judge consensus) even on cycle 1 (where there
+    # is no ``best_solution.json`` to compare against). Useful for live
+    # cross-vendor multi-judge verification when score>=0.95 is reached on
+    # cycle 1 (which would otherwise auto-stop without any judge LLM call).
+    judge_always_llm: bool = False
+
+    def cli_timeout_for(self, phase: str) -> int:
+        """Return the effective subprocess timeout (seconds) for ``phase``.
+
+        Per-phase overrides win when set; otherwise the runtime-wide
+        ``cli_timeout`` default is used. Unknown phase names fall back to the
+        default (defensive — this method is called from a string literal in
+        :py:func:`agent_loop.models.call_model`).
+        """
+        override = getattr(self, f"cli_timeout_{phase}", None)
+        if override is not None:
+            return int(override)
+        return int(self.cli_timeout)
 
     @field_validator("judges", mode="before")
     @classmethod
@@ -164,6 +202,15 @@ _ENV_MAP = {
     ("runtime", "max_cycles"): ("AGENT_LOOP_RUNTIME_MAX_CYCLES", int),
     ("runtime", "max_redo"): ("AGENT_LOOP_RUNTIME_MAX_REDO", int),
     ("runtime", "sandbox"): ("AGENT_LOOP_RUNTIME_SANDBOX", "bool"),
+    # v0.3.1 cli_timeout (default + per-phase overrides)
+    ("runtime", "cli_timeout"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT", int),
+    ("runtime", "cli_timeout_research"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_RESEARCH", int),
+    ("runtime", "cli_timeout_plan"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_PLAN", int),
+    ("runtime", "cli_timeout_implement"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_IMPLEMENT", int),
+    ("runtime", "cli_timeout_verify"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_VERIFY", int),
+    ("runtime", "cli_timeout_judge"): ("AGENT_LOOP_RUNTIME_CLI_TIMEOUT_JUDGE", int),
+    # v0.3.1 judge_always_llm
+    ("runtime", "judge_always_llm"): ("AGENT_LOOP_RUNTIME_JUDGE_ALWAYS_LLM", "bool"),
 }
 
 
@@ -231,6 +278,19 @@ per_run_usd = 2
 sandbox     = true
 max_cycles  = 10
 max_redo    = 3
+
+# v0.3.1 - subprocess timeout (seconds) for CLI providers. `cli_timeout`
+# is the default applied to every phase; per-phase overrides win when set.
+cli_timeout         = 600
+# cli_timeout_research = 600
+# cli_timeout_plan     = 600
+# cli_timeout_implement= 600
+# cli_timeout_verify   = 900
+# cli_timeout_judge    = 180
+
+# v0.3.1 - when true, disable the judge's first-cycle short-circuit and
+# always invoke the LLM (single or multi-judge consensus) even on cycle 1.
+judge_always_llm    = false
 """
 
 

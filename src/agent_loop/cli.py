@@ -108,6 +108,32 @@ def _override_strategies(cfg: Config, strategies: list[str] | None) -> Config:
     return cfg
 
 
+def _override_runtime_v031(
+    cfg: Config,
+    *,
+    cli_timeout: int | None,
+    cli_timeout_verify: int | None,
+    cli_timeout_judge: int | None,
+    judge_always_llm: bool,
+) -> Config:
+    """v0.3.1 — apply --cli-timeout / --cli-timeout-{verify,judge} / --judge-always-llm.
+
+    Only `verify` and `judge` get dedicated flags because those are the two
+    phases the live verification surfaced as needing tuning (claude verify
+    600 s timeout, judge first-cycle skip). Other phases remain settable via
+    config TOML or env var.
+    """
+    if cli_timeout is not None:
+        cfg.runtime.cli_timeout = int(cli_timeout)
+    if cli_timeout_verify is not None:
+        cfg.runtime.cli_timeout_verify = int(cli_timeout_verify)
+    if cli_timeout_judge is not None:
+        cfg.runtime.cli_timeout_judge = int(cli_timeout_judge)
+    if judge_always_llm:
+        cfg.runtime.judge_always_llm = True
+    return cfg
+
+
 @app.command("run")
 def cmd_run(
     task: str = typer.Argument(..., help="Task description (free-form prose)."),
@@ -129,6 +155,27 @@ def cmd_run(
         help="(v0.3) Multi-strategy plan provider id, repeatable. Cross-vendor recommended. "
         "Example: --strategy claude/default --strategy cursor/auto",
     ),
+    cli_timeout: Optional[int] = typer.Option(
+        None,
+        "--cli-timeout",
+        help="(v0.3.1) Default subprocess timeout (seconds) for CLI providers. Built-in default: 600.",
+    ),
+    cli_timeout_verify: Optional[int] = typer.Option(
+        None,
+        "--cli-timeout-verify",
+        help="(v0.3.1) Per-phase override for verify (overrides --cli-timeout for verify only).",
+    ),
+    cli_timeout_judge: Optional[int] = typer.Option(
+        None,
+        "--cli-timeout-judge",
+        help="(v0.3.1) Per-phase override for judge (overrides --cli-timeout for judge only).",
+    ),
+    judge_always_llm: bool = typer.Option(
+        False,
+        "--judge-always-llm",
+        help="(v0.3.1) Disable the first-cycle short-circuit and always invoke the judge LLM. "
+        "Required for genuine multi-judge cross-vendor verification when score>=0.95 on cycle 1.",
+    ),
 ) -> None:
     """Run a fresh task through the loop."""
     if mode not in ("auto", "supervised"):
@@ -137,6 +184,13 @@ def cmd_run(
     cfg = load_config(config_path)
     cfg = _override_judges(cfg, judge)
     cfg = _override_strategies(cfg, strategy)
+    cfg = _override_runtime_v031(
+        cfg,
+        cli_timeout=cli_timeout,
+        cli_timeout_verify=cli_timeout_verify,
+        cli_timeout_judge=cli_timeout_judge,
+        judge_always_llm=judge_always_llm,
+    )
     tid = task_id or new_task_id()
     td = TaskDir(root=root, task_id=tid)
     td.init()
@@ -237,6 +291,20 @@ def cmd_bench(
         "--strategy",
         help="(v0.3) Multi-strategy provider id, repeatable. Same semantics as `agent-loop run --strategy`.",
     ),
+    cli_timeout: Optional[int] = typer.Option(
+        None, "--cli-timeout", help="(v0.3.1) Default CLI subprocess timeout (seconds)."
+    ),
+    cli_timeout_verify: Optional[int] = typer.Option(
+        None, "--cli-timeout-verify", help="(v0.3.1) Per-phase verify override."
+    ),
+    cli_timeout_judge: Optional[int] = typer.Option(
+        None, "--cli-timeout-judge", help="(v0.3.1) Per-phase judge override."
+    ),
+    judge_always_llm: bool = typer.Option(
+        False,
+        "--judge-always-llm",
+        help="(v0.3.1) Disable judge first-cycle short-circuit (always call LLM).",
+    ),
 ) -> None:
     """Run a benchmark task from benchmarks/."""
     bench_dir = _find_benchmarks_dir()
@@ -254,6 +322,13 @@ def cmd_bench(
     cfg = load_config(config_path)
     cfg = _override_judges(cfg, judge)
     cfg = _override_strategies(cfg, strategy)
+    cfg = _override_runtime_v031(
+        cfg,
+        cli_timeout=cli_timeout,
+        cli_timeout_verify=cli_timeout_verify,
+        cli_timeout_judge=cli_timeout_judge,
+        judge_always_llm=judge_always_llm,
+    )
     for n in names:
         path = bench_dir / f"{n}.yaml"
         if not path.exists():

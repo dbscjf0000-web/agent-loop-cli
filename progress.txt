@@ -65,6 +65,57 @@
   All-fail → `AllStrategiesFailed` raise (single fallback 안 함, 명시적 에러). CLI: `--strategy` 반복가능,
   ENV `AGENT_LOOP_RUNTIME_STRATEGIES`. JudgeEngine 의 `_call_one` 패턴(Config 복제 + model 덮어쓰기)을
   strategy_engine 안에 복제 — 두 엔진 간 import X (engine 결합 회피).
+- v0.3.1 cli_timeout phase-aware: `Runtime.cli_timeout` (default 600) + 5개 per-phase
+  override 필드 (`cli_timeout_research|plan|implement|verify|judge`) + 헬퍼
+  `cli_timeout_for(phase)`. `models.call_model` 은 `cli_timeout=None` 일 때 `cfg.runtime.
+  cli_timeout_for(phase)` 로 폴백 (legacy `cursor_timeout` 은 phase 기본=600 인 경우에만 honor).
+  ENV: `AGENT_LOOP_RUNTIME_CLI_TIMEOUT[_<PHASE>]`. CLI: `--cli-timeout` /
+  `--cli-timeout-{verify,judge}` (run + bench).
+- v0.3.1 judge_always_llm: `Runtime.judge_always_llm` (default False). True 면 first-cycle
+  short-circuit 분기 통째 비활성 → single/multi 둘 다 cycle 1 에서도 LLM 호출. multi 모드는
+  `best_solution.json` 부재 시 `{}` stub 으로 prompt 렌더. ENV `AGENT_LOOP_RUNTIME_JUDGE_
+  ALWAYS_LLM=true`. CLI `--judge-always-llm` flag (run + bench). v0.3 backward compat 보존
+  (default off). free-form 1-cycle multi-judge 진짜 검증 의 게이트.
+
+---
+
+## [2026-04-27 18:30] - v0.3.1 cli_timeout per-phase + judge_always_llm
+- 구현:
+  - `src/agent_loop/config.py`: `Runtime` 에 7 개 신규 필드 (`cli_timeout`, 5 per-phase
+    override, `judge_always_llm`) + `cli_timeout_for(phase)` 헬퍼. `_ENV_MAP` 에 7 개
+    엔트리 추가. `_DEFAULT_TOML` 에 v0.3.1 항목 주석으로 노출.
+  - `src/agent_loop/models.py`: `call_model` 의 CLI 분기에서 `cli_timeout=None` 일 때
+    `cfg.runtime.cli_timeout_for(phase)` 로 폴백. legacy `cursor_timeout` 은 phase 기본
+    이 default(600) 인 경우에만 honor → backward compat.
+  - `src/agent_loop/workers.py`: `_run_judge_single` / `_run_judge_multi` 의 first-cycle
+    short-circuit 조건에 `not config.runtime.judge_always_llm` 추가. judge_always_llm=True
+    + first cycle 케이스에서 `best_solution.json` 부재 시 `{}` stub 으로 render.
+  - `src/agent_loop/cli.py`: `_override_runtime_v031` 헬퍼 + `run` / `bench` 에 4 개 새
+    flag (`--cli-timeout`, `--cli-timeout-verify`, `--cli-timeout-judge`,
+    `--judge-always-llm`).
+  - `src/agent_loop/__init__.py`: `__version__ = "0.3.1"`.
+  - `tests/test_cli_timeout.py` (9 tests): default, per-phase override, ENV default,
+    ENV per-phase, call_model phase-timeout 전달 (claude/gemini), 명시 kwarg 우선,
+    `_override_runtime_v031` 헬퍼 동작.
+  - `tests/test_judge_always_llm.py` (6 tests): 기본 short-circuit 보존, single +
+    judge_always_llm=True LLM 호출, multi + judge_always_llm=True fan-out, multi 기본
+    short-circuit, ENV override, CLI flag plumbing.
+  - `README.md`: Configuration 섹션에 v0.3.1 TOML + ENV 표 + CLI flag 표 + 사용 예시 추가.
+- 변경 파일: config.py, models.py, workers.py, cli.py, __init__.py, README.md, progress.txt
+  + 신규 tests/test_cli_timeout.py (9), tests/test_judge_always_llm.py (6)
+- 상태: 완료
+- 다음 할 일:
+  - (선택) 라이브 검증: claude/default verify 가 `--cli-timeout-verify 900` 으로 통과
+    하는지 + free-form 1-cycle 에서 `--judge-always-llm` 으로 multi-judge consensus 가
+    실제 LLM 호출되는지 (mock 으로 검증 완료, 라이브 검증은 워커 외부 작업).
+  - 워커 A 의 `judge first-cycle skip 옵션화` + `cli_timeout 환경변수 노출` 양쪽 모두 해소.
+- 학습:
+  - 패턴: phase-aware CLI timeout 은 `config.runtime.cli_timeout_for(phase)` 한 곳에서
+    분기 → call_model 에서만 조회. engine 코드 수정 X (call_model 위임).
+  - 주의사항: judge_always_llm=True 일 때 `best_solution.json` 부재 시 `{}` stub 필수
+    — 부재 → KeyError 방지. `_run_judge_single` + `_run_judge_multi` 양쪽 모두 동일 처리.
+    legacy `cursor_timeout` kwarg 는 phase 기본=600 일 때만 honor (backward compat).
+- pytest: 117 + 15 = 132 passed in 4.65s
 
 ---
 
