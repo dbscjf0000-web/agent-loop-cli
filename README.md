@@ -229,7 +229,12 @@ Every task gets its own directory under `--root` (default `./.agent_loop/`):
 ```
 .agent_loop/<task-id>/
 ├── task.md                       # Task description (free-form prose)
-├── memory.txt                    # Cross-cycle hints accumulated by the loop
+├── memory.txt                    # v0.1 legacy single-file memory
+├── memory.txt.v0_1.bak           # v0.2 migration backup (only when migrating)
+├── memory/                       # v0.2 3-tier memory (Context Engine)
+│   ├── history.jsonl             # Append-only audit trail (one JSON per phase)
+│   ├── episodic.md               # Compactor output, per-cycle one-liners
+│   └── core_facts.md             # Persistent patterns (CORE: lines + migrated v0.1)
 ├── workspace/                    # Phase I sandbox (where solution.py lives)
 │   ├── solution.py               # Latest implementation
 │   └── best_solution.py          # Snapshot of the best one so far
@@ -243,11 +248,48 @@ Every task gets its own directory under `--root` (default `./.agent_loop/`):
 │   ├── best_solution.json        # Promoted by Judge on improvement
 │   └── judge_result.json         # J output (better/action/scores)
 └── telemetry/
-    └── metrics.jsonl             # Per-phase tokens / cost / latency
+    └── metrics.jsonl             # Per-phase tokens / cost / latency + `_cycle_quality`
 ```
 
 `metrics.jsonl` is append-only; one JSON object per phase per cycle. Easy to grep, slice with
-`jq`, or feed into your own dashboards.
+`jq`, or feed into your own dashboards. Starting in v0.2 each cycle also emits a
+`_cycle_quality` row with the Context Engine's sensor metrics
+(`duplicate_ratio`, `contradiction_count`, `staleness_age_cycles`, `relevance_score`).
+
+## Context Engine (v0.2)
+
+The Context Engine replaces v0.1's single `memory.txt` with a 3-tier layout, plus
+sensors that score the prompt-context quality and a rule-based compactor that runs
+once per cycle.
+
+```
+memory/
+├── history.jsonl     # raw audit, append-only (one record per phase)
+├── episodic.md       # per-cycle one-liners + best-score markers (rebuilt by Compactor)
+└── core_facts.md     # persistent patterns; lines starting with `CORE:` accumulate here
+```
+
+Phase prompts receive `# Episodic\n... \n\n# Core Facts\n...` as the `{memory}`
+slot. The Compactor and sensors run after every cycle (in the orchestrator,
+right after promote / rollback) and emit a `_cycle_quality` row to
+`metrics.jsonl`:
+
+```jsonc
+{"phase": "_cycle_quality", "cycle": 2,
+ "quality": {"duplicate_ratio": 0.05, "contradiction_count": 0,
+             "staleness_age_cycles": 1, "relevance_score": 0.84},
+ "compact": {"size_before": 940, "size_after": 980, "lines_kept": 12, ...}}
+```
+
+Backward compat: an existing v0.1 task with `memory.txt` is migrated *once* —
+its content is copied into `core_facts.md`, the original is renamed to
+`memory.txt.v0_1.bak`, and `memory.txt` is left empty so v0.1 readers don't
+double-count. Resume works on both v0.1 and v0.2 task directories without a
+flag.
+
+The v0.2 Compactor and `contradiction_count` sensor are intentionally rule-based
+and LLM-free; v0.3 swaps in optional LLM-backed implementations behind the same
+`ContextEngine` interface.
 
 ## Benchmarks
 
@@ -330,12 +372,13 @@ or never started it via `run`, recreate `task.md` manually before resuming.
 
 ## Roadmap
 
-- **v0.1.1 (current)** — `cursor-agent` CLI added as a second provider next to litellm,
+- **v0.1.1** — `cursor-agent` CLI added as a second provider next to litellm,
   plus `agent-loop doctor` and `agent-loop test-model` for environment sanity checks.
-- **v0.2** — 3-tier memory (procedural / episodic / semantic), multi-axis Verify rubric,
-  Context Engine extraction (currently inlined in workers).
-- **v0.3** — Multi-judge consensus, multi-strategy parallel planning, model-router cost
-  optimization.
+- **v0.2 (current, partial)** — Context Engine: 3-tier memory + rule-based Compactor +
+  sensor metrics in `metrics.jsonl`. v0.1 `memory.txt` migrates automatically. Multi-axis
+  Verify rubric is the next milestone (separate worker).
+- **v0.3** — LLM-backed Compactor, multi-judge consensus, multi-strategy parallel
+  planning, model-router cost optimization.
 - **v0.4** — MCP server mode, cross-task memory, external sensors / tool plugins.
 
 See `docs/plan-v0.1.md` section 4 for the full scope ladder.

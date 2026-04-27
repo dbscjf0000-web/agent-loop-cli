@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_loop.config import Config
+from agent_loop.context import ContextEngine
 from agent_loop.models import ModelResponse, call_model
 from agent_loop.state import TaskDir
 
@@ -123,6 +124,33 @@ def _workspace_listing(task_dir: TaskDir) -> str:
     return "\n".join(lines) if lines else "(empty)"
 
 
+def _memory_text(task_dir: TaskDir) -> str:
+    """Render the v0.2 ContextEngine snapshot as the ``{memory}`` prompt slot.
+
+    Falls back to the legacy ``memory.txt`` content when the engine has no data
+    yet (very first phase of a fresh task) so the prompt never sees a blank
+    string when something useful is available.
+    """
+    eng = ContextEngine(task_dir)
+    eng.init()
+    snap = eng.snapshot()
+    rendered = snap.render()
+    if rendered.strip() in ("", "# Episodic\n(none)\n\n# Core Facts\n(none)"):
+        return "(none)"
+    return rendered
+
+
+def _summarize(text: str, limit: int = 200) -> str:
+    """Tiny summary helper — keep first non-empty line up to ``limit`` chars."""
+    if not text:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return text[:limit]
+
+
 def _import_check(task_dir: TaskDir, *, timeout: float = 5.0) -> str:
     """Run `python -c 'import solution'` against workspace/solution.py.
 
@@ -156,10 +184,24 @@ def _import_check(task_dir: TaskDir, *, timeout: float = 5.0) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _current_cycle(task_dir: TaskDir) -> int:
+    """Best-effort cycle number for ContextEngine history records.
+
+    Reads the latest checkpoint; missing checkpoint means cycle 1.
+    """
+    cp = task_dir.load_latest_checkpoint()
+    if not cp:
+        return 1
+    try:
+        return int(cp.get("cycle", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = task_dir.memory_md_path().read_text(encoding="utf-8")
-    prompt = _load_prompt("research").format(task=task, memory=memory or "(none)")
+    memory = _memory_text(task_dir)
+    prompt = _load_prompt("research").format(task=task, memory=memory)
     resp = call_model(
         "research",
         prompt,
@@ -168,15 +210,23 @@ def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
         workspace=task_dir.workspace_path(),
     )
     task_dir.write_artifact("findings.md", resp.text)
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "research",
+            "summary": _summarize(resp.text),
+            "model": resp.model,
+        }
+    )
     return resp
 
 
 def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = task_dir.memory_md_path().read_text(encoding="utf-8")
+    memory = _memory_text(task_dir)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
     prompt = _load_prompt("plan").format(
-        task=task, memory=memory or "(none)", findings=findings
+        task=task, memory=memory, findings=findings
     )
     resp = call_model(
         "plan",
@@ -186,6 +236,14 @@ def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
         workspace=task_dir.workspace_path(),
     )
     task_dir.write_artifact("plan.md", resp.text)
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "plan",
+            "summary": _summarize(resp.text),
+            "model": resp.model,
+        }
+    )
     return resp
 
 
@@ -222,6 +280,15 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     if code:
         (ws / "solution.py").write_text(code, encoding="utf-8")
     task_dir.write_artifact("execution_log.md", prose or resp.text)
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "implement",
+            "summary": _summarize(prose or resp.text),
+            "model": resp.model,
+            "wrote_solution_py": bool(code),
+        }
+    )
     return resp
 
 
@@ -263,6 +330,15 @@ def run_verify(task_dir: TaskDir, config: Config) -> ModelResponse:
             "_raw": resp.text[:2000],
         }
     task_dir.write_artifact("solution.json", parsed)
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "verify",
+            "summary": _summarize(str(parsed.get("evidence", "")) or resp.text),
+            "score": float(parsed.get("weighted_score", 0.0) or 0.0),
+            "model": resp.model,
+        }
+    )
     return resp
 
 
@@ -284,6 +360,16 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
             "scores": {"this_cycle": score, "best": None, "delta": None},
         }
         task_dir.write_artifact("judge_result.json", result)
+        ContextEngine(task_dir).append_history(
+            {
+                "cycle": _current_cycle(task_dir),
+                "phase": "judge",
+                "summary": result["reason"],
+                "hint": result.get("hint", ""),
+                "score": float(score or 0.0),
+                "model": "(skipped: first cycle)",
+            }
+        )
         return ModelResponse(
             text=json.dumps(result),
             prompt_tokens=0,
@@ -294,7 +380,7 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
         )
 
     task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = task_dir.memory_md_path().read_text(encoding="utf-8")
+    memory = _memory_text(task_dir)
     sol_obj = task_dir.read_artifact("solution.json") if task_dir.has_artifact("solution.json") else {}
     best_obj = task_dir.read_artifact("best_solution.json")
     sol_str = json.dumps(sol_obj, indent=2, ensure_ascii=False)
@@ -307,7 +393,7 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
         task=task,
         solution=sol_str,
         best_solution=best_str,
-        memory=memory or "(none)",
+        memory=memory,
         redo_count=redo_count,
         max_redo=max_redo,
     )
@@ -331,6 +417,17 @@ def run_judge(task_dir: TaskDir, config: Config) -> ModelResponse:
             "_raw": resp.text[:2000],
         }
     task_dir.write_artifact("judge_result.json", parsed)
+    scores = parsed.get("scores") if isinstance(parsed.get("scores"), dict) else {}
+    ContextEngine(task_dir).append_history(
+        {
+            "cycle": _current_cycle(task_dir),
+            "phase": "judge",
+            "summary": _summarize(str(parsed.get("reason", "")) or resp.text),
+            "hint": parsed.get("hint", ""),
+            "score": float(scores.get("this_cycle", 0.0) or 0.0) if isinstance(scores, dict) else 0.0,
+            "model": resp.model,
+        }
+    )
     return resp
 
 

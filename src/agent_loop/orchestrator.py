@@ -17,6 +17,7 @@ from typing import Any, Callable, Literal
 from rich.console import Console
 
 from agent_loop.config import Config
+from agent_loop.context import ContextEngine
 from agent_loop.models import ModelResponse
 from agent_loop.state import TaskDir
 from agent_loop.workers import (
@@ -71,6 +72,9 @@ class Orchestrator:
         self.config = config
         self.console = console or Console()
         self._confirm_plan = confirm_plan
+        # v0.2: Context Engine. init() is idempotent (safe on resume + creates
+        # the memory/ layout, migrating any legacy memory.txt once).
+        self.context = ContextEngine(task_dir)
 
     # ------------------------------------------------------------------
     # public API
@@ -84,6 +88,9 @@ class Orchestrator:
         max_redo: int = 3,
     ) -> dict[str, Any]:
         self.task_dir.init()
+        # ContextEngine layout (3-tier memory) — runs after TaskDir.init() so
+        # memory/ is guaranteed to exist before any phase reads from it.
+        self.context.init()
 
         # Persist task.md if not already there (resume case keeps the original).
         if not self.task_dir.task_md_path().read_text(encoding="utf-8").strip():
@@ -167,6 +174,24 @@ class Orchestrator:
             else:
                 self._rollback_to_best()
                 redo_count += 1
+
+            # ----- v0.2 Context Engine: compact + sensors -----
+            # Run after promote/rollback so the history reflects the final
+            # bookkeeping for this cycle, but before the loop exits so the
+            # quality metric is recorded for every cycle (including stop).
+            try:
+                compact_info = self.context.compact()
+                quality = self.context.sensors()
+                self.task_dir.append_metric(
+                    {
+                        "cycle": cycle,
+                        "phase": "_cycle_quality",
+                        "quality": quality,
+                        "compact": compact_info,
+                    }
+                )
+            except Exception as e:  # never let context bookkeeping break a run
+                self.console.print(f"[yellow]context engine warning: {e}[/yellow]")
 
             action = j.get("action", "stop")
             if action == "stop":

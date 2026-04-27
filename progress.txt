@@ -22,6 +22,15 @@
 - Test에서 litellm 호출은 monkeypatch로 `litellm.completion` + `litellm.completion_cost` 둘 다 패치.
 - v0.1.0 호출 entry point: `python3 -m agent_loop.cli` (KISTI inode 이슈 시). `module load python/3.12.4`는 같은 셸에서만 적용 — 매 Bash invocation 앞에 붙일 것.
 - `bench` 명령은 yaml `budget.max_cycles` / `max_redo`가 default; CLI `--cycles` / `--max-redo` 플래그가 override; `--dry-run`이면 task.md만 쓰고 LLM 호출 X (env에 API 키 없을 때 smoke 검증 경로).
+- v0.2 Context Engine: `src/agent_loop/context.py` 의 `ContextEngine` 한 클래스가 진입점.
+  3-tier memory = `memory/history.jsonl` (audit) + `memory/episodic.md` (Compactor 산출, prompt 노출) +
+  `memory/core_facts.md` (CORE: 라인 누적 + v0.1 마이그레이션). 각 phase worker 는 매 호출마다
+  `ContextEngine(task_dir).snapshot()` 로 prompt 의 `{memory}` 슬롯을 채우고 끝에
+  `append_history({...})` 한 줄을 audit 에 남긴다 (stateless).
+- Orchestrator 는 cycle 끝 (judge 직후) 에 `context.compact()` + `context.sensors()` 호출 →
+  `metrics.jsonl` 에 `phase: "_cycle_quality"` 행이 추가됨. compact 는 rule-based, LLM 호출 0.
+- v0.1 → v0.2 마이그레이션: `memory.txt` 가 비어 있지 않고 `core_facts.md` 가 비어 있으면 1 회만
+  복사 + `memory.txt.v0_1.bak` 백업. `init()` 은 idempotent (resume 안전).
 
 ---
 
@@ -320,4 +329,93 @@
     - cursor의 응답에는 종종 마크다운 블록 외 prose가 풍부 — `_extract_python` 첫 ```python```
       블록만 잡으므로 implementer는 코드를 가장 위에 두는 프롬프트 디자인이 안전 (현재 prompts/
       implement.md가 그렇게 되어 있음).
+---
+
+## [2026-04-27 14:00] - v0.2 Context Engine (3-tier memory + Sensors + Compactor)
+- 구현:
+  - `docs/plan-v0.2.md` 신규 (목표/스코프/모듈/마이그레이션/작업분해/성공기준 11절).
+  - `src/agent_loop/state.py`: `TaskDir.init()` 가 `memory/` 디렉토리도 생성, `memory_dir()` 헬퍼
+    추가. `memory_md_path()` 는 v0.1 backward compat 용으로 유지 (deprecated 표시 docstring).
+  - `src/agent_loop/context.py` (신규, 290 줄): `ContextEngine` 클래스 단일 + `MemorySnapshot`
+    dataclass. 5 메서드: `init` (마이그 포함), `append_history`, `snapshot`, `compact`,
+    `sensors`. rule-based — LLM 호출 0, 새 의존성 0.
+    - `compact()`: history.jsonl 전체 → cycle 별 1줄 요약 (`[c{cycle:>3}|{phase:<9}] summary
+      (score=...) ★best`). episodic.md 6KB 트리거 또는 force=True. 200 줄 cap, 초과 시
+      front (오래된 것)부터 drop. hint 의 `CORE:` prefix 라인은 core_facts.md 로 누적
+      (중복 dedup).
+    - `sensors()`: `duplicate_ratio` (lower-cased line dedup ratio), `contradiction_count`
+      (placeholder = 0, v0.3 LLM hook), `staleness_age_cycles` (max-min cycle in history),
+      `relevance_score` (`1.0 - clamp(len/8KB)` heuristic).
+    - 마이그레이션: `memory.txt` 비어 있지 않고 `core_facts.md` 비어 있고 `.v0_1.bak` 없으면
+      복사 + 백업 + 빈 memory.txt 로 reset (v0.1 readers 가 중복 안 보게).
+  - `src/agent_loop/workers.py`: 5 phase 모두 `_memory_text(task_dir)` 헬퍼 (즉석 ContextEngine
+    init + snapshot + render) 사용. 각 phase 끝에 `ContextEngine(td).append_history({cycle, phase,
+    summary, ...})` 호출. judge 의 short-circuit/LLM 두 갈래 모두 history 기록 + hint 남김.
+    `_current_cycle()` 헬퍼는 latest checkpoint 의 cycle 사용 (없으면 1).
+  - `src/agent_loop/orchestrator.py`: `__init__` 에서 `self.context = ContextEngine(td)` 보관,
+    `run()` 시작에서 `self.task_dir.init()` + `self.context.init()`. cycle 끝 (judge
+    promote/rollback 직후) 에 `compact() + sensors()` → `metrics.jsonl` 에
+    `{phase: "_cycle_quality", quality, compact}` 행 추가. try/except 로 ContextEngine 예외가
+    run 을 깨지 않게 보호.
+  - `tests/test_context.py` (10 tests): init/idempotent, v0.1 마이그/non-overwrite, history+
+    snapshot 라운드트립, compact 의 episodic 출력 + ★best 마커, CORE: hint dedup, sensors 의
+    duplicate_ratio/relevance(empty=1, half=~0.5, over budget=0)/staleness.
+  - `tests/test_context_e2e.py` (2 tests): mock 1 cycle 통합 — orchestrator 가 메모리 layout
+    생성 + history.jsonl 5+ 줄 + episodic 채워짐 + `_cycle_quality` row 의 4 sensor 키 모두
+    존재. v0.1 memory.txt 잔존 시 마이그레이션이 실제 run 중에 일어남도 검증.
+  - `README.md`: "State directory layout" 에 `memory/` 추가, "Context Engine (v0.2)" 신규
+    섹션 (3-tier 설명 + sensor JSON 예시 + 마이그레이션 정책 + LLM-free 명시), Roadmap v0.2 갱신.
+  - `docs/architecture.md`: Layered view 에 ContextEngine box 추가 (Phase Workers 의 leaf),
+    모듈 책임표에 context.py 행 추가, "Where v0.2+ plug in" → "v0.3+ plug in" 으로 갱신
+    ([DONE v0.2] 마커 + LLM Compactor 자리 표시).
+- 변경 파일:
+  - 신규: `src/agent_loop/context.py`, `tests/test_context.py`, `tests/test_context_e2e.py`,
+    `docs/plan-v0.2.md`
+  - 수정: `src/agent_loop/state.py` (memory_dir + init), `src/agent_loop/workers.py`
+    (5 phase + 2 헬퍼), `src/agent_loop/orchestrator.py` (context + compact),
+    `README.md`, `docs/architecture.md`, `progress.txt`
+- 상태: 완료. v0.2 Context Engine 트랙 끝. 다축 Verify Engine 은 별도 워커.
+- 검증:
+  - `python3 -m pytest tests/ -v` → **44 passed in 4.66s** (이전 32 + 새 12, regression 0).
+  - 분포: test_context.py 10 + test_context_e2e.py 2 = 새로 12 tests.
+  - 마이그레이션 단위 테스트 통과 (`test_v0_1_memory_txt_migrates_into_core_facts` +
+    `test_resume_with_v0_1_memory_txt_migrates`).
+  - `_cycle_quality` row 가 metrics.jsonl 에 정상 기록 + 4 sensor 키 모두 검증됨.
+- 알려진 한계 / 다음 워커 (다축 Verify Engine) 가 알아야 할 함정:
+  1. **Compact 는 매 cycle 무조건 호출됨** — history 가 없으면 no-op return. force=True 가
+     아니면 `triggered` 플래그가 size 가 6KB 미만일 때 False 일 수 있음 (테스트 통과는 무관).
+  2. **`_memory_text` 헬퍼 내부에서 `ContextEngine(td).init()` 을 매번 호출** — idempotent 라
+     싸지만, 만약 다축 Verify 가 phase 함수 내부에서 자체 ContextEngine 을 만들고 싶다면
+     중복 init 은 무해하다. 자체 인스턴스 유지하거나 헬퍼 호출하면 됨.
+  3. **`ContextEngine` 는 `TaskDir` 만 필요** — Config 안 받음. v0.3 LLM Compactor 도입 시에는
+     `compact(*, llm_call=None)` 같은 optional 콜백 파라미터로 확장 가능 (interface 안 깨고).
+  4. **`history.jsonl` 의 `summary` 는 200자 cap** — 길면 `...` 로 잘림. Verify 가 detailed
+     evidence 를 남기고 싶다면 `solution.json` 에 직접 쓰고 history 에는 한 줄 요약만 넣는 게 정석.
+  5. **`_cycle_quality` row 의 `phase` 값은 `"_cycle_quality"`** (밑줄 prefix). 기존 phase
+     filter 로직이 `r["phase"] in {"research","plan","implement","verify","judge"}` 같이
+     하드코드돼 있으면 quality row 가 자동 제외됨 (의도). Verify 가 metric을 후처리할 때 주의.
+  6. **`memory.txt.v0_1.bak` 는 commit 안 함** — `.gitignore` 에 명시 X 지만 `.agent_loop/`
+     자체가 이미 ignore 되므로 자연 제외. v0.2 task 디렉토리는 깃 추적되면 안 됨.
+  7. **Backward compat 테스트는 mock 으로만 검증** — 실제 v0.1.1 task 로 만든 `.agent_loop/<id>`
+     디렉토리에 `agent-loop resume <id>` 로 cursor-agent 살아 있는지는 안 검증함. 사용자 또는
+     별도 실행 워커가 필요. e2e 라이브 검증은 비용 회피로 의도적 skip.
+- 학습:
+  - 패턴:
+    - `ContextEngine(td)` 인스턴스는 phase 함수 안에서 즉석 생성 → 디스크 read 만이라 비용 0.
+      이렇게 하면 worker 시그니처 변경 X, stateless 원칙 유지.
+    - rule-based compactor 는 history.jsonl 의 raw audit 을 매번 처음부터 다시 읽어 episodic.md 를
+      통째로 rewrite 하는 idempotent 패턴. partial update 보다 디버깅 쉬움.
+    - `_cycle_quality` 처럼 phase 가 아닌 metric 행은 phase 이름에 underscore prefix 로 구분.
+      쉬운 grep + 기존 phase filter 자연 제외.
+    - 마이그레이션 가드 3중 (legacy 비어 있지 않음 + core_facts 비어 있음 + .v0_1.bak 없음) →
+      한 번만 일어나고 의도적으로 다시 안 일어남.
+  - 주의사항:
+    - `compact()` 가 lines 200 이상이면 front trim. 이게 정보 손실인지 의식할 것 — 200 cycle
+      이상은 실용 케이스에서 거의 없고, 그럴 땐 v0.3 LLM Compactor 가 들어갈 시점.
+    - `relevance_score` 는 length-bounded heuristic 이라 v0.2 에선 "episodic 이 길수록 관련성 X"
+      라는 가정. 실제론 길어도 다양성 높으면 좋음. v0.3 LLM 으로 대체 후보.
+    - phase worker 가 `_memory_text` 호출 시 ContextEngine 의 init 이 매번 돌지만,
+      이미 디렉토리/파일 있으면 모두 no-op (mkdir exist_ok + touch 안 함). 비용 무시 가능.
+    - prompts/*.md 의 `{memory}` placeholder 는 그대로. 새 형식 (`# Episodic ... # Core Facts ...`)
+      이 들어가도 prompt 가 그대로 동작 — 호환성 유지.
 ---
