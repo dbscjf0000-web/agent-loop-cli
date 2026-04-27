@@ -186,6 +186,9 @@ def run_agent_loop_once(
     timeout: int = 600,
     root_dir: Path | None = None,
     config_path: Path | None = None,
+    cycles: int = 1,
+    max_redo: int = 1,
+    judge_always_llm: bool = False,
 ) -> dict[str, Any]:
     """Invoke ``python -m agent_loop.cli bench <name>`` and harvest the score.
 
@@ -207,8 +210,12 @@ def run_agent_loop_once(
         "--root",
         str(root_dir),
         "--cycles",
-        "1",  # one full R/P/I/V/J cycle for fairness with baseline (one shot)
+        str(cycles),
+        "--max-redo",
+        str(max_redo),
     ]
+    if judge_always_llm:
+        cmd.append("--judge-always-llm")
     if config_path:
         cmd.extend(["--config", str(config_path)])
     env = dict(os.environ)
@@ -288,6 +295,9 @@ def run_comparison(
     baseline_timeout: int = 180,
     loop_timeout: int = 600,
     loop_config: Path | None = None,
+    loop_cycles: int = 1,
+    loop_max_redo: int = 1,
+    loop_judge_always_llm: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     rows = {"baseline": [], "agent_loop": []}
     for i in range(1, runs + 1):
@@ -318,7 +328,13 @@ def run_comparison(
     for i in range(1, runs + 1):
         try:
             r = run_agent_loop_once(
-                yaml_path, run_id=i, timeout=loop_timeout, config_path=loop_config
+                yaml_path,
+                run_id=i,
+                timeout=loop_timeout,
+                config_path=loop_config,
+                cycles=loop_cycles,
+                max_redo=loop_max_redo,
+                judge_always_llm=loop_judge_always_llm,
             )
         except Exception as exc:
             r = {
@@ -432,6 +448,19 @@ def main() -> int:
         help="agent-loop config TOML to use (defaults to ~/.agent-loop/config.toml). "
              "For cross-vendor comparison pin all phases to one provider via this flag.",
     )
+    ap.add_argument(
+        "--loop-cycles", type=int, default=1,
+        help="(v0.5.2) max R->P->I->V->J cycles for the agent-loop side. "
+             "Default 1 keeps backward compat; >=2 lets Judge feed hints back to Plan.",
+    )
+    ap.add_argument(
+        "--loop-max-redo", type=int, default=1,
+        help="(v0.5.2) max consecutive non-improving cycles before stop. Default 1.",
+    )
+    ap.add_argument(
+        "--loop-judge-always-llm", action="store_true",
+        help="(v0.5.2) force LLM judge call on cycle 1 (otherwise judge skips when no prior best).",
+    )
     args = ap.parse_args()
     loop_cfg = Path(args.loop_config) if args.loop_config else None
 
@@ -454,6 +483,9 @@ def main() -> int:
             baseline_timeout=args.baseline_timeout,
             loop_timeout=args.loop_timeout,
             loop_config=loop_cfg,
+            loop_cycles=args.loop_cycles,
+            loop_max_redo=args.loop_max_redo,
+            loop_judge_always_llm=args.loop_judge_always_llm,
         )
         all_rows.extend(rows["baseline"] + rows["agent_loop"])
         per_task[t] = {

@@ -1302,7 +1302,7 @@ python3 -m agent_loop.cli bench n_queens \
 
 Each yaml declares its own `budget.max_cycles` / `max_redo` / `max_usd`; CLI flags override.
 
-### Quantitative comparison (v0.5.1)
+### Quantitative comparison (v0.5.1 / v0.5.2)
 
 We measure what the 5-phase loop actually buys over a single shot. Both methods
 hit the same `cursor-agent` CLI with the same model (`cursor/auto`); both are
@@ -1318,62 +1318,91 @@ so only ground-truth evaluators (pytest / benchmark / ast_grep) score the run.
 Failed runs (timeouts, parse errors, crashes) are recorded as `score=0.0` and
 kept in the statistics.
 
-**Run** (one full cursor cycle vs one full R/P/I/V/J cycle, both `--cycles 1`):
+**Run.** Two configurations measured, same 4 tasks, n=2 each (KISTI Neuron):
 
 ```bash
 module load python/3.12.4
-python3 benchmarks/compare.py \
-    --tasks binary_search,n_queens,palindrome,sort_tuning \
-    --runs 2 \
-    --output /tmp/al_compare.csv \
-    --loop-config /tmp/al_compare_config.toml \
-    --baseline-timeout 90 --loop-timeout 300
+
+# v1: one full cursor cycle vs one full R/P/I/V/J cycle (cycles=1)
+python3 benchmarks/compare.py --tasks ... --runs 2 \
+    --output /tmp/al_compare.csv  --loop-config /tmp/al_compare_config.toml
+
+# v2 (v0.5.2): give the loop multi-cycle iteration budget
+python3 benchmarks/compare.py --tasks ... --runs 2 \
+    --output /tmp/al_compare3.csv --loop-config /tmp/al_compare3_config.toml \
+    --loop-cycles 3 --loop-max-redo 2 --loop-judge-always-llm
 ```
 
-**Results** (KISTI Neuron, n=2 per cell, total wall=12 min):
+**Three-way results** (KISTI Neuron, n=2 per cell):
 
-| Task            | Baseline μ ± σ (latency) | Agent-loop μ ± σ (latency) | Δ score | Δ time |
-|-----------------|--------------------------|----------------------------|---------|--------|
-| `binary_search` | 1.00 ± 0.00 (13 s)       | 1.00 ± 0.00 (60 s)         | +0.00   | +361 % |
-| `n_queens`      | 0.88 ± 0.00 (15 s)       | **1.00 ± 0.00** (71 s)     | +0.12   | +386 % |
-| `palindrome`    | 0.70 ± 0.00 (15 s)       | 0.70 ± 0.00 (68 s)         | +0.00   | +367 % |
-| `sort_tuning`   | 0.60 ± 0.00 (22 s)       | 0.60 ± 0.00 (82 s)         | +0.00   | +278 % |
+| Task            | Baseline μ (latency) | Agent-loop **cycles=1** μ (latency) | Agent-loop **cycles=3** μ (latency) | Δ vs baseline |
+|-----------------|----------------------|-------------------------------------|-------------------------------------|---------------|
+| `binary_search` | 1.00 (13 s)          | 1.00 (60 s)                         | 1.00 (68 s)                         | +0.00         |
+| `n_queens`      | 0.94 (15 s)          | **1.00** (71 s)                     | **1.00** (88 s)                     | +0.06 / +0.06 |
+| `palindrome`    | 0.70 (14 s)          | 0.70 (68 s)                         | 0.70 (217 s)                        | +0.00         |
+| `sort_tuning`   | 0.60 (22 s)          | 0.60 (82 s)                         | 0.60 (276 s)                        | +0.00         |
 
-**Per-axis findings** (raw CSV at `/tmp/al_compare.csv`):
+(`n_queens` baseline μ now 0.94 because run 2 of the v2 measurement got 0.876
+on the perf gate; v1 measured 0.88 as the lone non-1.00 baseline run.)
+
+**Per-axis findings** (raw CSVs at `/tmp/al_compare.csv` and `/tmp/al_compare3.csv`):
 
 - **`binary_search`** — both methods hit `correctness=1.00` (10/10 asserts) and
-  `complexity=1.00` (`for `≤1, no `.index(`). Trivial task, one-shot is enough.
+  `complexity=1.00` (`for `≤1, no `.index(`). Trivial task, one-shot is enough;
+  extra cycles do nothing useful (Judge correctly says "stop", same score).
 - **`n_queens`** — `correctness=1.00` for both. The win is on `performance`:
-  baseline median = ~2.7 s (linear partial drop, score 0.76), agent-loop = ~1.0 s
-  (under the 1.5 s threshold, score 1.00). The 5-phase loop produced a
-  bitmask-based backtracking solution; baseline produced a textbook recursive
-  backtracker that misses the perf gate.
-- **`palindrome`** — both correct on edge cases (8/8 asserts), both fail the
-  2000-char ≤ 1.0 s wall-clock gate. The single cycle of the agent-loop wasn't
-  enough to pivot to Manacher; would need `--cycles ≥ 2` with a redo budget.
-- **`sort_tuning`** — both correct, both fail the `≤ 0.9 × sorted()` ratio gate
-  (CPython's Timsort is already optimal on 95 %-sorted input). One cycle can't
-  beat a built-in.
+  baseline drifts (one run 0.876, one run 1.00), agent-loop is reliably 1.00 in
+  *both* configurations. The 5-phase loop produced a bitmask-based backtracking
+  solution; baseline often produced a textbook recursive backtracker that
+  partially misses the 1.5 s perf gate. cycles=3 doesn't add anything here
+  because cycle 1 already scored 1.00.
+- **`palindrome`** — both correct (8/8 asserts), both fail the 2000-char ≤ 1.0 s
+  wall-clock gate. **cycles=3 did not help.** Episodic memory shows Judge
+  consistently telling Plan to "redo the perf phase" without giving an
+  algorithmic pivot hint (e.g. Manacher) — Plan keeps producing the same
+  iterative O(n²) shape and Verify keeps failing the same gate. 3× the wall
+  clock for the same score.
+- **`sort_tuning`** — both correct, both fail the `≤ 0.9 × sorted()` ratio
+  gate. **cycles=3 did not help either.** The R-phase actually diagnosed (in
+  memory) that the prior failure was a benchmark-harness `TypeError` rather
+  than a true algorithmic miss, but the loop never recovered: Plan kept
+  producing pure-Python sorts that can't beat CPython's C Timsort. 12× the
+  wall clock for the same score.
 
 **Verdict.**
 
 | | when to prefer |
 |---|---|
 | **Baseline (1 cursor call)** | Trivial / well-defined tasks, score ≥ baseline already. ~4× faster, $0 incremental. |
-| **Agent-loop (R→P→I→V→J)** | Tasks with a non-trivial **performance gate** the LLM might miss on the first try (n_queens). Verify catches the failed gate; subsequent cycles iterate. Also necessary when you want a **typed verification report** (axis-by-axis, ground-truth) rather than just code. |
+| **Agent-loop (R→P→I→V→J), cycles=1** | Tasks with a non-trivial **performance gate** the LLM might miss on the first try (n_queens). Verify catches the failed gate; the structured prompt produces tighter code. Also when you want a **typed verification report** (axis-by-axis, ground-truth) rather than just code. |
+| **Agent-loop, cycles≥2** | *Honest answer from this experiment: not yet.* On the two tasks where iteration *should* matter (palindrome, sort_tuning), cycles=3 didn't move scores at all — the Judge correctly identified the failing axis but failed to push Plan into a different algorithm class. This is the **biggest open issue** for v0.6 (see below). |
 
-**Where 1 cycle isn't enough.** `palindrome` and `sort_tuning` show the limit
-of a single R/P/I/V/J pass: the engine correctly diagnosed `performance=0` but
-had no redo budget to fix it. Re-running with `--cycles 3 --max-redo 2` is the
-expected operating mode for harder tasks; this comparison deliberately uses
-`--cycles 1` to isolate the value of *the loop structure itself* from the
-value of *iteration*.
+**Where multi-cycle isn't (yet) enough.** The v2 numbers are the real surprise:
+the loop spent 200–280 seconds chewing through three full R/P/I/V/J cycles on
+`palindrome` / `sort_tuning` and produced exactly the same score as one cycle.
+Reading the per-cycle memory shows why — Judge's hint stays semantic ("the
+perf axis still fails, redo from research") instead of structural ("you tried
+iterative O(n²); try Manacher / try centring on the suffix-array" or "stop
+trying to beat the C-implemented sorted(); change the contract"). The loop
+*runs*, but doesn't *escape the local optimum* it landed in on cycle 1.
+
+**Implication for v0.6.** This is a Judge-prompt and/or multi-strategy
+problem, not a "more cycles" problem. Two concrete v0.6 candidates:
+
+1. **Strategy diversification on redo.** When Judge sees "same axis failed
+   twice", force the next Plan worker to either (a) pick from a different
+   algorithm family explicitly listed in the rubric, or (b) admit the gate is
+   unreachable and report it instead of looping.
+2. **Multi-strategy bake-off** (already implemented in v0.3, not used here).
+   Run two Plan workers on different prompts in parallel and keep the better
+   verified solution — increases the chance of escaping the local optimum.
 
 **Limits of this study.** (a) cursor-agent only — gemini / claude not measured
-(35-minute live budget). (b) n=2 per cell — enough to bracket variance for these
-deterministic-ish CLIs but not enough for tight CIs. (c) Single cycle for the
-loop method — agent-loop's value-add on `palindrome` / `sort_tuning` only
-appears past cycle 1. (d) No token / cost axis (cursor Pro = $0 metering).
+(time budget). (b) n=2 per cell — variance bracketed but CIs are wide. (c) v2
+sort_tuning agent-loop run #2 was killed mid-cycle-3 to hit the time budget;
+its cycle-2 score (0.60) was used as the final score — same as cycles 1+2,
+which is what would have happened anyway based on the trajectory.
+(d) No token / cost axis (cursor Pro = $0 metering).
 
 ## Migration from `agent-loop-plugin`
 

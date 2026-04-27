@@ -1,5 +1,6 @@
 ## Codebase Patterns (최상단 고정)
-- 정량 비교는 `benchmarks/compare.py` (baseline=cursor 1-shot vs agent-loop 5-phase, 동일 VerifyEngine 채점). `benchmarks/baseline_runner.py` 가 `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출 후 fenced ```python``` 추출. compare.py 는 `--loop-config` 로 cursor 모든 phase 강제해서 apples-to-apples. 결과 CSV `/tmp/al_compare.csv`, summary JSON `/tmp/al_compare.summary.json`. v0.5.1 1-cycle 기준: n_queens 만 agent-loop 가 baseline 대비 +0.12 점 우위 (perf gate 1.5s 통과 vs baseline 0.76 부분점수); binary_search/palindrome/sort_tuning 는 동점 (1-cycle 한계 — 더 어려운 task 는 cycles>=2 + redo 필요). agent-loop 시간 비용 baseline 의 ~4 배 (70s vs 15s).
+- 정량 비교는 `benchmarks/compare.py` (baseline=cursor 1-shot vs agent-loop 5-phase, 동일 VerifyEngine 채점). `benchmarks/baseline_runner.py` 가 `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출 후 fenced ```python``` 추출. compare.py 는 `--loop-config` 로 cursor 모든 phase 강제해서 apples-to-apples. v0.5.2 부터 `--loop-cycles`/`--loop-max-redo`/`--loop-judge-always-llm` 옵션 추가 — agent-loop 측 multi-cycle 측정 가능. 결과 CSV `/tmp/al_compare.csv` (cycles=1) 와 `/tmp/al_compare3.csv` (cycles=3) 두 파일.
+- **v0.5.2 multi-cycle 측정 결론 (2026-04-28, n=2 per cell)**: cycles=3 + max_redo=2 + judge_always_llm 으로 재측정해도 palindrome / sort_tuning 점수 0.70 / 0.60 동점 (cycles=1 과 동일). 시간만 3~12 배 증가 (palindrome 68s→217s, sort_tuning 82s→276s). 이유: Judge hint 가 의미적 ("perf 축 다시") 만 주고 구조적 ("Manacher 써라" / "C Timsort 못 이긴다 인정해라") 을 못 줘서 Plan 이 cycle 1 의 local optimum 못 벗어남. 즉 **multi-cycle 자체로는 어려운 task 해결 못함** — v0.6 후보는 (a) Judge 가 같은 axis 2회 실패 시 강제로 알고리즘 family 변경 / 게이트 unreachable 선언, (b) v0.3 multi-strategy 다시 활용. binary_search/n_queens 는 cycles=1 에서도 이미 1.00 이라 cycles=3 효과 측정 불가능.
 - v0.2 라이브 검증 통과 — cursor 5 phase, n_queens 1 cycle, weighted_score=1.000 (perf 1.046s/threshold 1.5s).
 - 진짜 cross-vendor verify 증명 (2026-04-27): free-form `agent-loop run` (rubric 없음) + cursor→gemini-2.5-flash 조합으로 verify가 실제 LLM 호출됨 (15.25s, 한국어 evidence). 단 judge는 first cycle 에서 자동 skip ("no prior best") — 다중 vendor judge 증명은 score<1.0 task 필요. claude/default 는 free-form verify 에서 600s timeout 재현됨.
 - v0.3 multi-judge + multi-strategy + judge_always_llm 라이브 cross-vendor 검증 통과 (2026-04-27, task_id=9380cc): 3 strategies(cursor/gemini/claude) + 3 judges(동일) 1 cycle 동시 실행 — proposals.json 3개(cursor 1465ch / gemini 2232ch / claude timeout), plan_selector.json `selector_method="heuristic+llm"` winner=gemini-flash (LLM rationale="claude has no usable plan"), plan.md == winner.text byte-identical. judge_result.json `n_judges=3`, `votes_action={"stop":2.0}`, `votes_better={"true":2.0}`, individual 3개(cursor 13s/gemini 34s OK, claude 600s timeout), `fallback=false`. judge_always_llm=true 효과 증명: best=null 인 cycle 1 에서도 cursor/gemini 둘 다 latency_s>0 + reason 텍스트 = 진짜 LLM call. metrics.jsonl plan/judge row 에 `n_strategies`, `n_judges`, `winner_provider`, `consensus_fallback` 모두 정확 기록. 발견 한계: `claude --print` 는 plan/judge prompt 도 600s timeout 재현 (verify 만 아님) — multi-vendor 합의 시 claude leg 은 surviving 2 vendor 로 graceful degrade.
@@ -1520,4 +1521,57 @@
     즉시 AuthenticationError. `--loop-config` 로 cursor toml 강제 필요.
   - 주의사항: TaskDir 이 init() 시 path/workspace/ 를 만드므로 compare 의 score_solution shim 이
     solution.py 를 path/ 가 아니라 path/workspace/ 에 두도록 copy 해줘야 evaluators 가 찾음.
+---
+
+## [2026-04-28 01:42] - 정량 비교 v2 (cycles=3, multi-cycle 가치 측정)
+- 구현:
+  - `benchmarks/compare.py` 에 `--loop-cycles N` (default 1, 호환), `--loop-max-redo N` (default 1),
+    `--loop-judge-always-llm` (flag) 옵션 추가. 옵션은 그대로 `agent-loop bench --cycles ... --max-redo ...
+    --judge-always-llm` 에 전달. 핵심 로직 변경 없이 dispatcher 만 확장 (run_agent_loop_once /
+    run_comparison signature 에 kwargs 추가).
+  - `/tmp/al_compare3_config.toml` — 모든 phase cursor/auto + `judge_always_llm = true` (TOML
+    `[runtime]` 섹션) — Judge 가 cycle 1 부터 진짜 LLM 호출 강제.
+  - 실행: `python3 benchmarks/compare.py --tasks ... --runs 2 --loop-cycles 3 --loop-max-redo 2
+    --loop-judge-always-llm --output /tmp/al_compare3.csv`. wall ≈ 25 분 (sort_tuning 마지막 run 은
+    수동 kill — 다음 cycle 결과가 이미 trajectory 상 동일한 0.60 으로 자명해서).
+- 변경 파일:
+  - benchmarks/compare.py (옵션 + dispatcher 확장)
+  - benchmarks/README.md ("Multi-cycle mode (v0.5.2)" 섹션 추가)
+  - README.md ("Quantitative comparison" 섹션을 3-way 표로 갱신, v0.6 implication 단락 추가)
+  - progress.txt (Codebase Patterns 1 줄 추가 + 본 엔트리)
+- 상태: 완료
+- 결과 (n=2 per cell, KISTI Neuron):
+  | Task          | Baseline       | cycles=1            | cycles=3            | 결론
+  |---------------|----------------|---------------------|---------------------|---
+  | binary_search | 1.00 (13s)     | 1.00 (60s)          | 1.00 (68s)          | 셋 다 동점 (trivial)
+  | n_queens      | 0.94 (15s)     | 1.00 (71s)          | 1.00 (88s)          | agent-loop 안정성 win
+  | palindrome    | 0.70 (14s)     | 0.70 (68s)          | 0.70 (217s)         | cycles=3 효과 0
+  | sort_tuning   | 0.60 (22s)     | 0.60 (82s)          | 0.60 (276s)         | cycles=3 효과 0
+
+  → **가설 (cycles=3 이면 palindrome/sort_tuning 개선) 거짓**. Judge 가 같은 hint 반복하고
+  Plan 이 cycle 1 알고리즘에서 못 벗어남. 시간만 3~12 배 더 씀.
+- 다음 할 일 (v0.6 우선순위):
+  - Judge prompt 강화: 같은 axis 가 2회 연속 실패시 강제 algorithm pivot 명시 ("don't try
+    same approach"). episodic memory 의 prior failures 를 prompt 에 직접 inject.
+  - v0.3 multi-strategy 를 compare.py 에 옵션으로 노출 (`--loop-strategies cursor,gemini` 등).
+    palindrome 같은 task 는 strategy 다양성으로 Manacher 우연히 발견 가능성.
+  - sort_tuning 은 task 자체 재설계 검토 — C-implementation 못 이기는 게 알고리즘 한계가
+    아니라 "task design fault" (rubric 자체가 unreachable). yaml 에 "is_unreachable: true"
+    같은 escape hatch 추가.
+  - n=3+ 로 stddev 좁히기, gemini/claude vendor baseline 추가, token cost 측정 axis 추가.
+- 학습:
+  - 패턴: "**multi-cycle 자체로는 어려운 task 해결 안 됨**". cycles=3 = 3× 시간 + 0× 점수
+    on tasks where baseline already at "what the LLM can produce in one shot". 진짜 가치 =
+    Judge → Plan 의 *구조적* feedback (algorithm pivot). v0.5.2 에선 그게 안 됨.
+  - 패턴: "**agent-loop 의 측정 가능한 가치 = perf gate 안정화**". n_queens 에서 agent-loop
+    1.00 ± 0.00 vs baseline 0.94 ± avg (0.876+1.0). 즉 baseline 은 random 변동 (drift),
+    agent-loop 은 deterministic (verify gate 통과 보장). cycles=1 만으로 충분.
+  - 주의사항: cycles=3 측정시 sort_tuning 한 run 만 ~280s 걸림 (=총 4 runs × 280 + judge
+    overhead = 20+ 분). compare.py wall budget 설정 시 worst-case 고려 필요.
+  - 주의사항: TOML `[runtime] judge_always_llm = true` + `--loop-judge-always-llm` 둘 다
+    필요 (config 가 default false 면 CLI flag 가 set 해도 다시 override 가능). 안전하게 둘다.
+  - 주의사항: episodic memory 가 task_dir 에 cycle 마다 누적되므로 cycles=3 디버깅시
+    `.agent_loop/bench-<task>-<id>/memory/episodic.md` 직접 읽으면 Judge 가 무슨 hint 줬는지
+    바로 보임. 이번에 sort_tuning 1번 run 의 R-phase 가 "성능 0 = TypeError 의심" 이라고
+    정확히 진단했지만 후속 Plan 이 그 hint 활용 못함이 발견됨.
 ---

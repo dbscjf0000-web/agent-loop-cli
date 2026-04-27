@@ -60,6 +60,33 @@ python3 benchmarks/compare.py \
     --loop-timeout 300
 ```
 
+### Multi-cycle mode (v0.5.2)
+
+By default `compare.py` pins the agent-loop side to `--cycles 1` so the
+comparison isolates the *loop structure* from the value of *iteration*. To
+measure what extra cycles + Judge feedback actually buy, use the v0.5.2 flags:
+
+```bash
+python3 benchmarks/compare.py \
+    --tasks binary_search,n_queens,palindrome,sort_tuning \
+    --runs 2 \
+    --output /tmp/al_compare3.csv \
+    --loop-config /tmp/al_compare3_config.toml \
+    --loop-cycles 3 \
+    --loop-max-redo 2 \
+    --loop-judge-always-llm \
+    --baseline-timeout 90 \
+    --loop-timeout 600
+```
+
+New flags:
+
+- `--loop-cycles N` — max R→P→I→V→J cycles (default 1).
+- `--loop-max-redo N` — max consecutive non-improving cycles before stop (default 1).
+- `--loop-judge-always-llm` — force LLM judge call even on cycle 1 (otherwise
+  judge short-circuits when there is no prior best). The matching config
+  should also set `judge_always_llm = true` in `[runtime]`.
+
 Outputs:
 
 - `<output>` — long-form CSV, one row per (task, method, run_id).
@@ -68,4 +95,5 @@ Outputs:
 
 Failed runs (timeouts, missing fenced block, evaluator crash) are kept in
 the statistics with `weighted_score = 0.0`. See the README's
-"Quantitative comparison (v0.5.1)" section for the headline numbers.
+"Quantitative comparison" section for the headline numbers (cycles=1 vs
+cycles=3 three-way table).
