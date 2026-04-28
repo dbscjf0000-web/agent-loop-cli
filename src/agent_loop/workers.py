@@ -209,6 +209,153 @@ def _current_cycle(task_dir: TaskDir) -> int:
         return 1
 
 
+def _collect_prior_cycles_summary(task_dir: TaskDir, *, max_chars: int = 2000) -> str:
+    """Render a per-cycle summary of past attempts for the Judge prompt.
+
+    v0.6 Judge enhancement. The single-LLM and multi-judge paths both inject
+    this string into the ``{prior_cycles}`` placeholder so the judge can:
+      - Detect axes that have been < 0.5 for two+ cycles (stuck-axis pivot).
+      - See prior hints verbatim and avoid repeating them.
+      - Glance at the last attempted ``solution.py`` to ground its reasoning.
+
+    Returns ``""`` (empty string) when there are no prior cycles yet (cycle 1)
+    so the prompt template still renders cleanly without spurious "no prior"
+    boilerplate clutter.
+
+    Data sources (all already on disk; no extra LLM cost):
+      1. ``memory/history.jsonl`` — per-phase audit rows. We collect verify
+         rows (score / axes summary) and judge rows (prior hint + reason).
+      2. ``workspace/best_solution.py`` — the last accepted solution code.
+         Truncated to keep the prompt small.
+
+    Output format (markdown bullet list, fits the prompt nicely)::
+
+        - Cycle 1: weighted_score=0.70, axes={correctness:1.0, perf:0.0, ...},
+          hint_received="(none)", attempted_excerpt="def find(s): ..."
+        - Cycle 2: weighted_score=0.70, axes={..., perf:0.0},
+          hint_received="perf axis again", attempted_excerpt="(unchanged)"
+
+    The ``max_chars`` cap is enforced *after* assembly. We truncate from the
+    front (older cycles fall off first) so the most recent attempt always
+    survives — that's what the judge most needs to reason about a pivot.
+    """
+    history_path = task_dir.memory_dir() / "history.jsonl"
+    if not history_path.exists():
+        return ""
+
+    # Group rows by cycle — only verify/judge rows carry useful score+hint data.
+    by_cycle: dict[int, dict[str, Any]] = {}
+    try:
+        with history_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cyc = rec.get("cycle")
+                if not isinstance(cyc, int):
+                    continue
+                phase = rec.get("phase")
+                if phase not in ("verify", "judge"):
+                    continue
+                slot = by_cycle.setdefault(cyc, {})
+                if phase == "verify":
+                    slot["score"] = rec.get("score")
+                    # ContextEngine writes a summary string; we keep it raw so
+                    # the judge can read the axis labels embedded in it.
+                    slot["verify_summary"] = rec.get("summary") or ""
+                elif phase == "judge":
+                    # Judge hint is what the *previous* judge told the loop to
+                    # do — exactly what we want to flag as "do not repeat".
+                    slot["judge_hint"] = rec.get("hint") or ""
+                    slot["judge_reason"] = rec.get("summary") or ""
+    except OSError:
+        return ""
+
+    if not by_cycle:
+        return ""
+
+    # Pull axes details from the canonical solution.json (current cycle's
+    # latest verify result — gives us per-axis score, not just summary).
+    # We add this only for the most recent cycle since older axes are not
+    # easily reconstructible from history alone.
+    latest_axes_text = ""
+    if task_dir.has_artifact("solution.json"):
+        sol = task_dir.read_artifact("solution.json")
+        if isinstance(sol, dict):
+            axes = sol.get("axes")
+            if isinstance(axes, list):
+                pairs: list[str] = []
+                for ax in axes:
+                    if not isinstance(ax, dict):
+                        continue
+                    name = ax.get("name") or "?"
+                    score = ax.get("score")
+                    if isinstance(score, (int, float)):
+                        pairs.append(f"{name}:{float(score):.2f}")
+                if pairs:
+                    latest_axes_text = "{" + ", ".join(pairs) + "}"
+
+    # Last attempted code excerpt (short).
+    sol_py = task_dir.workspace_path() / "solution.py"
+    code_excerpt = ""
+    if sol_py.exists():
+        try:
+            raw = sol_py.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = ""
+        code_excerpt = raw[:500].rstrip()
+
+    # Render bullets in cycle order.
+    lines: list[str] = ["## Prior cycles"]
+    for cyc in sorted(by_cycle.keys()):
+        slot = by_cycle[cyc]
+        score = slot.get("score")
+        score_txt = f"{float(score):.2f}" if isinstance(score, (int, float)) else "?"
+        hint = (slot.get("judge_hint") or "(none)").strip().replace("\n", " ")
+        if len(hint) > 200:
+            hint = hint[:197] + "..."
+        verify_sum = (slot.get("verify_summary") or "").strip().replace("\n", " ")
+        if len(verify_sum) > 200:
+            verify_sum = verify_sum[:197] + "..."
+        # First line of the bullet — score + hint received from this cycle's judge.
+        bullet = (
+            f"- Cycle {cyc}: weighted_score={score_txt}, "
+            f"hint_received=\"{hint}\""
+        )
+        if verify_sum:
+            bullet += f", verify=\"{verify_sum}\""
+        lines.append(bullet)
+
+    if latest_axes_text:
+        lines.append(f"- Latest axes: {latest_axes_text}")
+    if code_excerpt:
+        lines.append("- Last attempted code (excerpt):")
+        lines.append("```python")
+        lines.append(code_excerpt)
+        lines.append("```")
+
+    rendered = "\n".join(lines)
+    if len(rendered) <= max_chars:
+        return rendered
+
+    # Truncate from the front (drop older cycles first).
+    # We rebuild instead of slicing string mid-line.
+    keep_lines = lines[:1]  # always keep "## Prior cycles" header
+    cycle_lines = lines[1:-2 if code_excerpt else len(lines)]  # may include axes
+    tail_lines = lines[-2:] if code_excerpt else []
+    while cycle_lines and len("\n".join(keep_lines + cycle_lines + tail_lines)) > max_chars:
+        cycle_lines = cycle_lines[1:]
+    final = "\n".join(keep_lines + cycle_lines + tail_lines)
+    if len(final) > max_chars:
+        # Last resort: hard truncate.
+        final = final[: max_chars - 4] + "\n..."
+    return final
+
+
 def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
@@ -676,6 +823,8 @@ def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
 
     max_redo = config.runtime.max_redo
     redo_count = _current_redo_count(task_dir)
+    # v0.6: stuck-axis pivot context. Empty string on cycle 1 (no history).
+    prior_cycles = _collect_prior_cycles_summary(task_dir)
 
     prompt = _load_prompt("judge").format(
         task=task,
@@ -684,6 +833,7 @@ def _run_judge_single(task_dir: TaskDir, config: Config) -> ModelResponse:
         memory=memory,
         redo_count=redo_count,
         max_redo=max_redo,
+        prior_cycles=prior_cycles,
     )
     resp = call_model(
         "judge",
@@ -756,6 +906,8 @@ def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
 
     max_redo = config.runtime.max_redo
     redo_count = _current_redo_count(task_dir)
+    # v0.6: same stuck-axis context as single-judge so multi-judge can pivot too.
+    prior_cycles = _collect_prior_cycles_summary(task_dir)
 
     prompt = _load_prompt("judge").format(
         task=task,
@@ -764,6 +916,7 @@ def _run_judge_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
         memory=memory,
         redo_count=redo_count,
         max_redo=max_redo,
+        prior_cycles=prior_cycles,
     )
 
     engine = JudgeEngine(task_dir, config)

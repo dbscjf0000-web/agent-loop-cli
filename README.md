@@ -7,6 +7,24 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.6.0** — Judge prompt enhancement (`prior_cycles` injection +
+Reasoning Constraints). Multi-cycle Judge now sees a per-cycle summary of
+prior `weighted_score` / hints / axes plus a code excerpt of the last
+attempted `solution.py`, and the prompt enforces three new rules:
+(1) when an axis stays < 0.5 for 2+ cycles the hint **must** name a
+different algorithm family, (2) hints cannot repeat verbatim across
+cycles, and (3) every hint must mention a concrete algorithm
+(Manacher / KMP / ...) , library (`bisect`, `heapq`, `numpy`, ...),
+or complexity change (`O(n^2)` → `O(n log n)`). v0.5 cycles produced
+abstract hints like "perf axis again"; v0.6 live `bench palindrome`
+(cycles=3, cursor/auto, judge_always_llm) produced concrete hints
+including "expand-around-center O(n^2) → Manacher O(n)" and
+"`timeit` / `pytest-benchmark` with `stmt='longest_palindrome(...)'`"
+across all three cycles. 204 unit tests passing (199 v0.5.1 + 5 new
+`test_judge_prior_cycles.py` tests). No new dependencies, no new phases,
+no schema breaks — fully backward compatible (existing `judge.md`
+template gets one new placeholder; old prompts without it still render).
+
 **v0.5.1** — Fixed a stdout/JSON-RPC interleave bug discovered in v0.5.0
 live verification. The orchestrator now accepts an injected `console=`
 parameter; the MCP server passes a stderr-bound `Console` so progress
@@ -1472,6 +1490,17 @@ or never started it via `run`, recreate `task.md` manually before resuming.
 - **v0.3** — LLM-backed Compactor, multi-judge consensus, multi-strategy parallel
   planning, model-router cost optimization.
 - **v0.4** — MCP server mode, cross-task memory, external sensors / tool plugins.
+- **v0.6 Judge enhancement** — `prior_cycles` injection so the judge can detect
+  stuck axes and force algorithm-family pivots. Adds a `{prior_cycles}`
+  placeholder to `prompts/judge.md` and a `_collect_prior_cycles_summary`
+  helper in `workers.py` that reads `memory/history.jsonl` (verify scores,
+  prior judge hints) plus `workspace/solution.py` (last attempted code
+  excerpt, ~500 chars). Three new Reasoning Constraints in the prompt:
+  stuck-axis pivot, hint-repetition ban, concrete-technique requirement.
+  Live `bench palindrome` (cycles=3) produced hints that named "Manacher
+  O(n)", "expand-around-center O(n^2)", "`timeit` / `pytest-benchmark`
+  with `stmt=...`" across cycles — vs. v0.5's abstract "perf axis again".
+  No new dependencies, no new phases, no schema changes.
 
 See `docs/plan-v0.1.md` section 4 for the full scope ladder.
 
