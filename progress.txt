@@ -1,4 +1,5 @@
 ## Codebase Patterns (최상단 고정)
+- v0.7 Plan prompt 에 `prior_judge_hint` inject (`workers._collect_prior_judge_hint`) — `memory/history.jsonl` 역순 walk 해서 가장 최근 `phase=judge` row 의 비어있지 않은 `hint` 반환, 폴백으로 `artifacts/judge_result.json` (resume 안전). cycle 1 에서는 빈 문자열 → prompt 에는 `(none — first cycle or no prior judge hint)` 마커 렌더. `prompts/plan.md` 에 `{prior_judge_hint}` placeholder + `## Reasoning Constraints` 섹션 (a) 명시된 알고리즘/라이브러리/측정도구 그대로 채택, (b) 직전 cycle 알고리즘 family 반복 금지, (c) plan 안에 hint 인용 의무. `_run_plan_single` / `_run_plan_multi` 둘 다 같은 헬퍼 호출 (multi-strategy fan-out 도 동일 prompt). max_chars=1000 cap 으로 hint 폭주 방지. v0.6 backward compat: 새 placeholder 1개 추가뿐, 기존 placeholder 3개 유지.
 - v0.6 Judge prompt 에 `prior_cycles` inject (`workers._collect_prior_cycles_summary`) — `memory/history.jsonl` 의 verify score / prior judge hint + `solution.json` axes + `workspace/solution.py` 첫 500자 모아 prompt 의 `{prior_cycles}` 슬롯에 주입. Reasoning Constraint 3 가지: (1) 같은 axis 2회 < 0.5 면 algorithm family 강제 pivot, (2) hint verbatim 반복 금지, (3) 모든 hint 는 알고리즘/라이브러리/복잡도 중 하나 명시. `_run_judge_single` / `_run_judge_multi` 둘 다 같은 헬퍼 호출 (multi 도 prompt 동일). cycle 1 (history 비어있음) → 헬퍼 빈 문자열 반환 → 기존 prompt 와 동등하게 렌더. v0.5 backward compat 유지: 기존 placeholder 6개 그대로 + `{prior_cycles}` 1개 추가. 라이브 검증: `bench palindrome --cycles 3` 에서 hint 진화 확인 — cycle 1 "Manacher O(n) 로 피벗", cycle 2 "Manacher O(n) 교체", cycle 3 "timeit / pytest-benchmark stmt 명시 + Manacher". v0.5 추상적 "perf 다시" → v0.6 구체적 알고리즘/라이브러리/복잡도 신호.
 - 정량 비교는 `benchmarks/compare.py` (baseline=cursor 1-shot vs agent-loop 5-phase, 동일 VerifyEngine 채점). `benchmarks/baseline_runner.py` 가 `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출 후 fenced ```python``` 추출. compare.py 는 `--loop-config` 로 cursor 모든 phase 강제해서 apples-to-apples. v0.5.2 부터 `--loop-cycles`/`--loop-max-redo`/`--loop-judge-always-llm` 옵션 추가 — agent-loop 측 multi-cycle 측정 가능. 결과 CSV `/tmp/al_compare.csv` (cycles=1) 와 `/tmp/al_compare3.csv` (cycles=3) 두 파일.
 - **v0.5.2 multi-cycle 측정 결론 (2026-04-28, n=2 per cell)**: cycles=3 + max_redo=2 + judge_always_llm 으로 재측정해도 palindrome / sort_tuning 점수 0.70 / 0.60 동점 (cycles=1 과 동일). 시간만 3~12 배 증가 (palindrome 68s→217s, sort_tuning 82s→276s). 이유: Judge hint 가 의미적 ("perf 축 다시") 만 주고 구조적 ("Manacher 써라" / "C Timsort 못 이긴다 인정해라") 을 못 줘서 Plan 이 cycle 1 의 local optimum 못 벗어남. 즉 **multi-cycle 자체로는 어려운 task 해결 못함** — v0.6 후보는 (a) Judge 가 같은 axis 2회 실패 시 강제로 알고리즘 family 변경 / 게이트 unreachable 선언, (b) v0.3 multi-strategy 다시 활용. binary_search/n_queens 는 cycles=1 에서도 이미 1.00 이라 cycles=3 효과 측정 불가능.
@@ -147,6 +148,40 @@
   /apps/applications/PYTHON/3.14.2/bin/python3 tests/e2e_mcp_subprocess.py`. 두
   스크립트 모두 pytest 외부에 둠 (실 subprocess + 외부 LLM 의존이라 CI 부적합).
 
+---
+
+## [2026-04-27 26:00] - v0.7.0 Plan prompt enforces Judge hints
+- 구현:
+  - `src/agent_loop/prompts/plan.md`: 새 `{prior_judge_hint}` placeholder 와
+    `## Reasoning Constraints` 섹션 (3 rule). 기존 3 placeholder (task / memory
+    / findings) 유지 — 추가만.
+  - `src/agent_loop/workers.py`: 새 헬퍼 `_collect_prior_judge_hint(task_dir,
+    *, max_chars=1000)` — `memory/history.jsonl` 를 역순 walk 해서 가장 최근
+    `phase=judge` row 의 비어있지 않은 `hint` 반환. 빈/누락은 skip 하고 더
+    오래된 row 로 fall through. 폴백으로 `artifacts/judge_result.json` (resume
+    안전). 1000자 cap 후 `...` suffix.
+  - `_run_plan_single` / `_run_plan_multi` 둘 다 헬퍼 호출 + prompt format 시
+    `prior_judge_hint=...` 또는 cycle 1 에서는 explicit marker
+    "(none — first cycle or no prior judge hint)" 전달.
+  - `tests/test_plan_prior_hint.py` 신규 — 7 tests (helper 5 + plan worker 2):
+    cycle 1 빈 문자열, 가장 최근 hint 반환, judge_result.json 폴백, 길이 cap,
+    빈 hint skip, prompt 에 hint 등장, cycle 1 에 marker 등장.
+  - `src/agent_loop/__init__.py`: `0.6.0` → `0.7.0`.
+  - `README.md`: v0.7.0 status 블록 추가 (v0.6 위에).
+- 변경 파일: prompts/plan.md, workers.py (+76 lines new helper, plan format
+  체인지), tests/test_plan_prior_hint.py (new), __init__.py, README.md,
+  progress.txt.
+- 상태: 완료. unit 211 passed (204 v0.6 + 7 new). v0.6 backward compat 유지.
+- 다음 할 일: 라이브 palindrome cycles=3 검증 → plan.md 안에 "Manacher" 명시
+  적 등장 / weighted_score 0.85+ 입증.
+- 학습:
+  - 패턴: history.jsonl 역순 walk 가 "가장 최근 X" 추출의 표준 패턴 (judge
+    rows 만 수가 적어 O(N) 도 OK).
+  - 패턴: Plan 의 multi-strategy 분기는 prompt 자체를 받아오므로 placeholder
+    채우는 책임은 호출자(workers) 에 단일화되어 있다 — strategy_engine 수정
+    불필요. v0.6 judge 의 패턴과 동일.
+  - 주의사항: format 호출 시 placeholder 가 한 개라도 빠지면 KeyError.
+    multi 분기도 똑같이 채워야 함.
 ---
 
 ## [2026-04-27 25:30] - v0.5.1 fix: stdout interleave bug

@@ -356,6 +356,83 @@ def _collect_prior_cycles_summary(task_dir: TaskDir, *, max_chars: int = 2000) -
     return final
 
 
+def _collect_prior_judge_hint(task_dir: TaskDir, *, max_chars: int = 1000) -> str:
+    """Return the most recent judge ``hint`` (verbatim) from prior cycles, or ``""``.
+
+    v0.7 Plan enhancement. The Plan worker injects this string into the
+    ``{prior_judge_hint}`` placeholder so the planner is forced to honor the
+    judge's structural recommendation (e.g. "use Manacher's algorithm O(n)")
+    instead of regenerating the same approach that already produced the
+    current (insufficient) weighted_score.
+
+    Empty string is returned when:
+      - history.jsonl does not exist (cycle 1, fresh task), or
+      - no judge row in history.jsonl carries a non-empty ``hint`` field, or
+      - the file cannot be opened.
+
+    The string is capped at ``max_chars`` (default 1000) so a runaway hint
+    cannot inflate the plan prompt. Truncation is suffixed with "...".
+
+    Data sources (in priority order, both already on disk — no LLM cost):
+      1. ``memory/history.jsonl`` — search backwards for the last
+         ``phase=judge`` row whose ``hint`` is a non-empty string. This is
+         the canonical place workers append per-phase audit data.
+      2. ``artifacts/judge_result.json`` — fallback for the case where the
+         orchestrator wrote the file but the history row was lost (rare, but
+         this artifact persists across resume so we honor it).
+
+    Notes:
+      - We do *not* filter by current cycle. The "most recent prior hint" is
+        whatever the most recent judge call produced. On cycle 1 there are
+        no judge rows yet → empty string returned, which is the right answer.
+      - We deliberately return the hint verbatim (no rewording, no extra
+        framing) so the Plan prompt section can show it inside fenced text
+        without surprises.
+    """
+    history_path = task_dir.memory_dir() / "history.jsonl"
+    hint = ""
+    if history_path.exists():
+        try:
+            with history_path.open("r", encoding="utf-8") as f:
+                rows = f.readlines()
+        except OSError:
+            rows = []
+        # Walk backward — newest entries are at the bottom of the JSONL file.
+        for line in reversed(rows):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("phase") != "judge":
+                continue
+            h = rec.get("hint")
+            if isinstance(h, str) and h.strip():
+                hint = h.strip()
+                break
+
+    # Fallback: judge_result.json (last completed judge of any prior cycle).
+    if not hint and task_dir.has_artifact("judge_result.json"):
+        try:
+            jr = task_dir.read_artifact("judge_result.json")
+        except Exception:  # pragma: no cover - defensive
+            jr = None
+        if isinstance(jr, dict):
+            h = jr.get("hint")
+            if isinstance(h, str) and h.strip():
+                hint = h.strip()
+
+    if not hint:
+        return ""
+
+    # Length cap (defensive: hints are usually short, but a model could ramble).
+    if len(hint) > max_chars:
+        hint = hint[: max_chars - 3].rstrip() + "..."
+    return hint
+
+
 def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
@@ -496,12 +573,23 @@ def run_plan(task_dir: TaskDir, config: Config) -> ModelResponse:
 
 
 def _run_plan_single(task_dir: TaskDir, config: Config) -> ModelResponse:
-    """v0.1 / v0.2 body: single LLM plan call. Preserved verbatim for backward compat."""
+    """v0.1 / v0.2 body: single LLM plan call.
+
+    v0.7: now also passes ``prior_judge_hint`` so the planner is forced to
+    honor the most recent judge recommendation (e.g. "use Manacher's
+    algorithm O(n)"). On cycle 1 the helper returns "" and the prompt's
+    "Prior Judge Hint" block is rendered empty — equivalent to the prior
+    behavior.
+    """
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
+    prior_judge_hint = _collect_prior_judge_hint(task_dir)
     prompt = _load_prompt("plan").format(
-        task=task, memory=memory, findings=findings
+        task=task,
+        memory=memory,
+        findings=findings,
+        prior_judge_hint=prior_judge_hint or "(none — first cycle or no prior judge hint)",
     )
     resp = call_model(
         "plan",
@@ -545,8 +633,14 @@ def _run_plan_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
+    # v0.7: same prior-judge-hint injection as single mode so multi-strategy
+    # fan-out also forces every candidate to honor the judge's recommendation.
+    prior_judge_hint = _collect_prior_judge_hint(task_dir)
     prompt = _load_prompt("plan").format(
-        task=task, memory=memory, findings=findings
+        task=task,
+        memory=memory,
+        findings=findings,
+        prior_judge_hint=prior_judge_hint or "(none — first cycle or no prior judge hint)",
     )
 
     engine = StrategyEngine(task_dir, config)

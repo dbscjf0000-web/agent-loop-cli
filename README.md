@@ -7,6 +7,25 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.7.0** — Plan prompt enhancement (`prior_judge_hint` injection +
+Reasoning Constraints in `plan.md`). v0.6 made the Judge produce concrete
+algorithmic hints like "expand-around-center O(n²) → Manacher O(n)" but
+the Plan worker had no awareness of those hints, so cycle 2 / 3
+re-generated the same family of plan and the score stayed flat at 0.70.
+v0.7 closes that loop: a new helper `_collect_prior_judge_hint`
+walks `memory/history.jsonl` (with a fallback to `artifacts/judge_result.json`)
+and feeds the most recent non-empty hint into a new `{prior_judge_hint}`
+placeholder in `prompts/plan.md`. The prompt now contains an explicit
+"Reasoning Constraints" section ordering the planner to (a) honor the
+named algorithm / library / measurement, (b) avoid repeating the prior
+algorithm family, and (c) cite the hint inline. Both `_run_plan_single`
+and `_run_plan_multi` use the same helper, so multi-strategy fan-out
+benefits identically. 211 unit tests passing (204 v0.6.0 + 7 new
+`test_plan_prior_hint.py` tests). Cycle 1 renders an explicit
+"(none — first cycle or no prior judge hint)" marker so the prompt is
+unchanged in semantics for first-cycle runs. No schema break, no new
+dependency, no new phase — fully backward compatible with v0.6 configs.
+
 **v0.6.0** — Judge prompt enhancement (`prior_cycles` injection +
 Reasoning Constraints). Multi-cycle Judge now sees a per-cycle summary of
 prior `weighted_score` / hints / axes plus a code excerpt of the last
