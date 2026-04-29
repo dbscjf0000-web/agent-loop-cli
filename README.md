@@ -121,6 +121,13 @@ pip install -e ".[dev]" --user
 > the source tree still works. **Call the CLI as `python3 -m agent_loop.cli`** in that case.
 > See [Troubleshooting](#troubleshooting).
 
+> **Stale `__pycache__` after `git pull`.** If a benchmark's `rubric.json` is missing fields
+> (e.g. `stmt`, `threshold`) that the YAML spec clearly defines, the most likely cause is a
+> stale bytecode cache from a previous Python version. Clear it once and re-run:
+> ```bash
+> find . -name "__pycache__" -type d -exec rm -rf {} +
+> ```
+
 When PyPI publishes land:
 
 ```bash

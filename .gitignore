@@ -9,3 +9,6 @@ build/
 .coverage
 *.swp
 .DS_Store
+
+# Local live-verify configs
+al_*.toml

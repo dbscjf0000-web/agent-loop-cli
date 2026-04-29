@@ -1,5 +1,7 @@
 ## Codebase Patterns (최상단 고정)
-- v0.7 Plan prompt 에 `prior_judge_hint` inject (`workers._collect_prior_judge_hint`) — `memory/history.jsonl` 역순 walk 해서 가장 최근 `phase=judge` row 의 비어있지 않은 `hint` 반환, 폴백으로 `artifacts/judge_result.json` (resume 안전). cycle 1 에서는 빈 문자열 → prompt 에는 `(none — first cycle or no prior judge hint)` 마커 렌더. `prompts/plan.md` 에 `{prior_judge_hint}` placeholder + `## Reasoning Constraints` 섹션 (a) 명시된 알고리즘/라이브러리/측정도구 그대로 채택, (b) 직전 cycle 알고리즘 family 반복 금지, (c) plan 안에 hint 인용 의무. `_run_plan_single` / `_run_plan_multi` 둘 다 같은 헬퍼 호출 (multi-strategy fan-out 도 동일 prompt). max_chars=1000 cap 으로 hint 폭주 방지. v0.6 backward compat: 새 placeholder 1개 추가뿐, 기존 placeholder 3개 유지.
+- v0.7.2 Plan prompt 에 single `{prior_context_block}` placeholder — workers._build_prior_context_block(task_dir) 가 cycle 1 에서는 빈 문자열, cycle 2+ 에서만 (Prior Judge Hint + Prior Cycles + Reasoning Constraints) 통합 블록 렌더. cycle 1 prompt 가 v0.6 byte-identical → cursor-agent 가 sentinel 조건 평가에 reasoning 낭비하던 timeout 제거. codex 리뷰 권고 (constraint 1 모호성 + Plan 에 prior algorithm 정보 부재) 둘 다 해소. 라이브 입증 (composer-2 sort_tuning cycles=3, 2026-04-29): cycle 1=0.60 → cycle 3=**0.94** (perf 0.84, ratio 1.04) — agent-loop-cli 첫 진짜 multi-cycle 개선. plan.md 가 Judge hint 명시 인용 + 이전 사이클 알고리즘 family (Counting sort 계열) 명시 기각.
+- v0.7 Plan prompt 에 `prior_judge_hint` inject (`workers._collect_prior_judge_hint`) — `memory/history.jsonl` 역순 walk 해서 가장 최근 `phase=judge` row 의 비어있지 않은 `hint` 반환, 폴백으로 `artifacts/judge_result.json` (resume 안전). v0.7.0 ~ v0.7.1 시기엔 cycle 1 에 sentinel marker 렌더했으나 v0.7.2 부터 `_build_prior_context_block` 으로 통합 (cycle 1 = block 자체 미렌더). max_chars=1000 cap 으로 hint 폭주 방지.
+- ⚠️ KISTI stale `__pycache__` 함정 (2026-04-29): `verify_engine.cpython-314.pyc` 가 옛 yaml_to_rubric (stmt/baseline_stmt forwarding 없는 버전) 캐시 → bench rubric.json 에서 perf axis 측정 필드 누락 → score 천장 발생 (palindrome 0.70 / sort_tuning 0.60). `find . -name __pycache__ -type d -exec rm -rf {} +` 한 번이면 해결. README 에 노트 추가됨. Python 3.14 alpha 의 mtime invalidation 이 병렬 import 와 race condition 가능.
 - v0.6 Judge prompt 에 `prior_cycles` inject (`workers._collect_prior_cycles_summary`) — `memory/history.jsonl` 의 verify score / prior judge hint + `solution.json` axes + `workspace/solution.py` 첫 500자 모아 prompt 의 `{prior_cycles}` 슬롯에 주입. Reasoning Constraint 3 가지: (1) 같은 axis 2회 < 0.5 면 algorithm family 강제 pivot, (2) hint verbatim 반복 금지, (3) 모든 hint 는 알고리즘/라이브러리/복잡도 중 하나 명시. `_run_judge_single` / `_run_judge_multi` 둘 다 같은 헬퍼 호출 (multi 도 prompt 동일). cycle 1 (history 비어있음) → 헬퍼 빈 문자열 반환 → 기존 prompt 와 동등하게 렌더. v0.5 backward compat 유지: 기존 placeholder 6개 그대로 + `{prior_cycles}` 1개 추가. 라이브 검증: `bench palindrome --cycles 3` 에서 hint 진화 확인 — cycle 1 "Manacher O(n) 로 피벗", cycle 2 "Manacher O(n) 교체", cycle 3 "timeit / pytest-benchmark stmt 명시 + Manacher". v0.5 추상적 "perf 다시" → v0.6 구체적 알고리즘/라이브러리/복잡도 신호.
 - 정량 비교는 `benchmarks/compare.py` (baseline=cursor 1-shot vs agent-loop 5-phase, 동일 VerifyEngine 채점). `benchmarks/baseline_runner.py` 가 `cursor-agent --print --output-format text --force --trust --workspace=<ws> "<prompt>"` 1회 호출 후 fenced ```python``` 추출. compare.py 는 `--loop-config` 로 cursor 모든 phase 강제해서 apples-to-apples. v0.5.2 부터 `--loop-cycles`/`--loop-max-redo`/`--loop-judge-always-llm` 옵션 추가 — agent-loop 측 multi-cycle 측정 가능. 결과 CSV `/tmp/al_compare.csv` (cycles=1) 와 `/tmp/al_compare3.csv` (cycles=3) 두 파일.
 - **v0.5.2 multi-cycle 측정 결론 (2026-04-28, n=2 per cell)**: cycles=3 + max_redo=2 + judge_always_llm 으로 재측정해도 palindrome / sort_tuning 점수 0.70 / 0.60 동점 (cycles=1 과 동일). 시간만 3~12 배 증가 (palindrome 68s→217s, sort_tuning 82s→276s). 이유: Judge hint 가 의미적 ("perf 축 다시") 만 주고 구조적 ("Manacher 써라" / "C Timsort 못 이긴다 인정해라") 을 못 줘서 Plan 이 cycle 1 의 local optimum 못 벗어남. 즉 **multi-cycle 자체로는 어려운 task 해결 못함** — v0.6 후보는 (a) Judge 가 같은 axis 2회 실패 시 강제로 알고리즘 family 변경 / 게이트 unreachable 선언, (b) v0.3 multi-strategy 다시 활용. binary_search/n_queens 는 cycles=1 에서도 이미 1.00 이라 cycles=3 효과 측정 불가능.
@@ -148,6 +150,57 @@
   /apps/applications/PYTHON/3.14.2/bin/python3 tests/e2e_mcp_subprocess.py`. 두
   스크립트 모두 pytest 외부에 둠 (실 subprocess + 외부 LLM 의존이라 CI 부적합).
 
+---
+
+## [2026-04-29 14:30] - v0.7.2 codex review fixes + multi-cycle 진짜 작동 입증
+- 배경: codex 리뷰 (cask 아닌 codex CLI 직접 호출) 가 v0.7.0 plan prompt 의
+  2개 issue 지적 — (높음) Reasoning Constraint 1 의 cycle 1 marker 가 항상
+  non-empty 라 모델이 항상 "hint 인용" 시도, (중간) Constraint 2 가 prior
+  algorithm 정보 없이 "family 반복 금지" 만 요구해 정보 부족.
+- v0.7.1 첫 시도 (sentinel + conditional rules + prior_cycles 추가):
+  prompt 가 길어져 cursor-agent composer-2 가 cycle 1 에서 300s/600s 두 번
+  연속 timeout. 원인: 모든 sentinel 이 (none) 인 상태에서 모델이 conditional
+  evaluation 에 reasoning budget 낭비.
+- v0.7.2 fix: plan.md 의 sentinel 섹션 + Reasoning Constraints 를 single
+  `{prior_context_block}` placeholder 로 통합. 새 헬퍼
+  `workers._build_prior_context_block(task_dir)` 가 cycle 1 (hint=="" and
+  cycles=="") 에서는 ""(빈문자열) 반환 → prompt 가 v0.6 와 byte-identical.
+  cycle 2+ 에서만 (Prior Judge Hint + Prior Cycles + Reasoning Constraints)
+  완전체 블록 렌더. `_run_plan_single` / `_run_plan_multi` 둘 다 동일 헬퍼.
+- 변경 파일: `prompts/plan.md` (Reasoning Constraints 섹션 통째 placeholder
+  로 교체), `workers.py` (헬퍼 추가 + 두 plan 함수 단일 placeholder 호출),
+  `tests/test_plan_prior_hint.py` (cycle 1 marker 부재 검증으로 갱신),
+  `README.md` (stale __pycache__ 노트 추가), `__init__.py` (0.7.0→0.7.2),
+  `al_composer2.toml` (라이브 검증용 영구 config).
+- 상태: 완료. unit 211 passed.
+- 라이브 검증 (composer-2, cycles=3):
+  | task          | cycle 1 | cycle 3 | improvement      |
+  |---------------|---------|---------|------------------|
+  | palindrome    | 1.000   | (stop)  | rubric stmt fix  |
+  | binary_search | 1.000   | (stop)  | -                |
+  | n_queens      | 1.000   | (stop)  | -                |
+  | sort_tuning   | 0.600   | 0.938   | **+0.34 (+56%)** |
+  sort_tuning cycle 3 plan.md: "Judge 추천에 따라... 대안 (B) Run 검출 +
+  heapq.merge (Judge 명시)... Counting sort 계열: C Timsort 에 불리,
+  ratio≫0.9 — **기각**." → v0.7.2 의 hint 인용 + family 명시 기각 둘 다
+  실측 작동. agent-loop-cli 가 multi-cycle iteration 으로 score 개선한 첫
+  사례 (v0.5.2 측정에선 cycles=3 도 cycle 1 동점이었음).
+- 부수 발견: KISTI 의 stale `verify_engine.cpython-314.pyc` 가 yaml_to_rubric
+  의 stmt/baseline_stmt 전달 안 하는 옛 버전을 cache 해서 bench rubric.json
+  의 perf axis 가 측정 불능 (palindrome 0.70 천장, sort_tuning timeout 5x).
+  `find . -name __pycache__ -type d -exec rm -rf {} +` 후 정상. README 에
+  노트.
+- 다음 할 일: PyPI publish 토큰 받으면 `python3 -m build && twine upload`,
+  agent-loop-plugin README 에 cross-link, GitHub PAT 사용자 직접 revoke.
+- 학습:
+  - 패턴: prompt 에 conditional sentinel 추가는 reasoning cost. cycle 1 에서
+    아예 섹션 미렌더가 더 안전 (overhead 0).
+  - 패턴: codex 리뷰는 prompt-level 이슈에 강함 (LLM 입장에서 모호한 표현
+    감지). 수동 리뷰로는 놓치기 쉬움.
+  - 주의사항: KISTI inode quota + stale .pyc + Python 3.14 alpha 조합은
+    debugging 시간 폭증 — 의심 증상 (rubric 필드 누락) 시 첫 가설을 .pyc 정리.
+  - 주의사항: cursor-agent composer-2 는 hard task 에서 prompt 길이에 민감
+    (sort_tuning cycle 1 timeout). agentic CLI 라 내부 tool 호출 반복 가능.
 ---
 
 ## [2026-04-27 26:00] - v0.7.0 Plan prompt enforces Judge hints

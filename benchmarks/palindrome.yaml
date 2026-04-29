@@ -26,6 +26,7 @@ success_criteria:
   - axis: performance
     weight: 0.3
     target: "On 2000-char input, finishes in ≤ 1.0s"
+    stmt: longest_palindrome("a" * 2000)
     measure: wall_clock_seconds
     threshold: 1.0
 

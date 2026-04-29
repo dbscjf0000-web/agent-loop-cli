@@ -28,23 +28,7 @@ Research 결과를 받아 **구현 계획서**(`plan.md`)를 만듭니다.
 ```
 {findings}
 ```
-
-### Prior Judge Hint
-```
-{prior_judge_hint}
-```
-
-## Reasoning Constraints
-- If a prior judge hint is provided above (i.e. the section is non-empty),
-  your plan MUST honor it: use the named algorithm / library / measurement
-  approach exactly as recommended.
-- Do NOT propose the same algorithm family that prior cycles used (this is a
-  regression — prior attempts already produced the current weighted_score and
-  the judge has explicitly told us to pivot).
-- Cite the prior hint explicitly in your plan, e.g. "Following Judge's
-  recommendation to use Manacher's algorithm, ...".
-- If the hint specifies a library or measurement tool (e.g. timeit,
-  pytest-benchmark), include it in section 4 (Verification Plan).
+{prior_context_block}
 
 ## 작성할 문서: `plan.md`
 

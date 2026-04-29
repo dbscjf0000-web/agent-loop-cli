@@ -433,6 +433,48 @@ def _collect_prior_judge_hint(task_dir: TaskDir, *, max_chars: int = 1000) -> st
     return hint
 
 
+def _build_prior_context_block(task_dir: TaskDir) -> str:
+    """Render the Plan prompt's prior-context block, or "" on cycle 1.
+
+    v0.7.1 (codex review fix): cycle 1 has no prior data, so injecting
+    sentinel sections + Reasoning Constraints just makes the model spend
+    extra reasoning verifying that sentinels really mean "nothing to do".
+    Returning an empty string here means cycle 1 prompts are byte-identical
+    to v0.6 — no constraint-evaluation overhead — while cycle 2+ get the
+    full block (hint + prior cycles + rules) only when there is real
+    context to honor.
+    """
+    hint = _collect_prior_judge_hint(task_dir)
+    cycles = _collect_prior_cycles_summary(task_dir)
+    if not hint and not cycles:
+        return ""
+
+    parts: list[str] = ["", ""]  # blank line separator from {findings}
+    if hint:
+        parts += ["### Prior Judge Hint", "```", hint, "```", ""]
+    if cycles:
+        parts += [
+            "### Prior Cycles (recent attempts + algorithms)",
+            "```",
+            cycles,
+            "```",
+            "",
+        ]
+    parts += [
+        "## Reasoning Constraints",
+        "- Your plan MUST honor the Prior Judge Hint above (if present): use the",
+        "  named algorithm / library / measurement approach exactly as recommended,",
+        "  and cite it explicitly, e.g. \"Following Judge's recommendation to use",
+        "  Manacher's algorithm, ...\".",
+        "- Do NOT propose the same algorithm family any prior cycle's",
+        "  attempted_excerpt already used. Name the rejected family in section 2's",
+        "  \"대안과 기각 이유\".",
+        "- If the hint specifies a library or measurement tool (e.g. timeit,",
+        "  pytest-benchmark), include it in section 4 (Verification Plan).",
+    ]
+    return "\n".join(parts)
+
+
 def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
@@ -584,12 +626,11 @@ def _run_plan_single(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
-    prior_judge_hint = _collect_prior_judge_hint(task_dir)
     prompt = _load_prompt("plan").format(
         task=task,
         memory=memory,
         findings=findings,
-        prior_judge_hint=prior_judge_hint or "(none — first cycle or no prior judge hint)",
+        prior_context_block=_build_prior_context_block(task_dir),
     )
     resp = call_model(
         "plan",
@@ -633,14 +674,16 @@ def _run_plan_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     memory = _memory_text(task_dir, config)
     findings = _read_or(task_dir, "findings.md", "(no findings)")
-    # v0.7: same prior-judge-hint injection as single mode so multi-strategy
-    # fan-out also forces every candidate to honor the judge's recommendation.
-    prior_judge_hint = _collect_prior_judge_hint(task_dir)
+    # v0.7.1: same prior-context block as single mode so every multi-strategy
+    # candidate honors judge hint + sees prior algorithms. Block is empty on
+    # cycle 1 → no Reasoning Constraints overhead when there is nothing to
+    # constrain (codex review fix: avoids cursor-agent deliberating on
+    # always-true sentinel conditions).
     prompt = _load_prompt("plan").format(
         task=task,
         memory=memory,
         findings=findings,
-        prior_judge_hint=prior_judge_hint or "(none — first cycle or no prior judge hint)",
+        prior_context_block=_build_prior_context_block(task_dir),
     )
 
     engine = StrategyEngine(task_dir, config)

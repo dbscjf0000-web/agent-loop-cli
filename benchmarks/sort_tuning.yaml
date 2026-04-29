@@ -26,8 +26,23 @@ success_criteria:
   - axis: performance
     weight: 0.4
     target: "On 95%-sorted input of 100,000 ints, smart_sort wall time ≤ 0.9× sorted()"
+    setup: |
+      import random
+      from functools import partial
+      random.seed(42)
+      from solution import *
+      n = 100_000
+      test_array = list(range(n))
+      for _ in range(5000):
+          i = random.randrange(n)
+          j = random.randrange(n)
+          test_array[i], test_array[j] = test_array[j], test_array[i]
+    stmt: "_ = smart_sort(test_array)"
+    baseline_stmt: "_ = partial(sorted, test_array)()"
     measure: speedup_ratio
     threshold: 0.9
+    repeats: 3
+    timeout: 60
 
 budget:
   max_cycles: 5

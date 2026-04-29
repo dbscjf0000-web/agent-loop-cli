@@ -171,10 +171,17 @@ def test_run_plan_single_passes_prior_judge_hint_to_prompt(
     assert "Reasoning Constraints" in p
 
 
-def test_run_plan_single_renders_empty_hint_marker_on_cycle_1(
+def test_run_plan_single_omits_prior_context_on_cycle_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cycle 1: no judge history → prompt still renders cleanly with marker."""
+    """Cycle 1: no judge history → prior-context block is empty (no overhead).
+
+    v0.7.2: dropping Reasoning Constraints + sentinel sections on cycle 1
+    makes the prompt byte-identical to v0.6 there, avoiding the
+    cursor-agent timeout we saw on hard tasks (sort_tuning) where the
+    model wasted reasoning budget evaluating always-true sentinel
+    conditions.
+    """
     td = TaskDir(root=tmp_path, task_id="ggg777")
     td.init()
     td.task_md_path().write_text("dummy task", encoding="utf-8")
@@ -193,6 +200,8 @@ def test_run_plan_single_renders_empty_hint_marker_on_cycle_1(
     workers.run_plan(td, Config())
 
     p = captured.get("prompt", "")
-    # Section is still there, but the body shows the explicit "no prior" marker.
-    assert "Prior Judge Hint" in p
-    assert "first cycle" in p or "no prior judge hint" in p
+    # Sections must be absent on cycle 1 (zero v0.7 overhead when there
+    # is no prior context to honor).
+    assert "Prior Judge Hint" not in p
+    assert "Prior Cycles" not in p
+    assert "Reasoning Constraints" not in p
