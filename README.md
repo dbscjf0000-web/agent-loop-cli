@@ -7,7 +7,37 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
-**v0.7.0** — Plan prompt enhancement (`prior_judge_hint` injection +
+**v0.7.2** — Codex review fixes for v0.7.0 (cycle 1 prompt diet) +
+**first proven multi-cycle improvement** in agent-loop-cli history.
+Live verified with `cursor/composer-2`, `--cycles 3`, ground-truth
+rubric:
+
+| task          | cycle 1 | cycle 3 | improvement      |
+|---------------|---------|---------|------------------|
+| palindrome    | 1.000   | (stop)  | rubric stmt fix  |
+| binary_search | 1.000   | (stop)  | -                |
+| n_queens      | 1.000   | (stop)  | -                |
+| sort_tuning   | 0.600   | 0.938   | **+0.34 (+56%)** |
+
+`sort_tuning` is the headline result: `composer-2`'s cycle 3 plan cited
+the Judge's hint verbatim (`Following Judge's recommendation ...
+대안 (B) Run 검출 + heapq.merge`) and explicitly rejected the prior
+cycle's algorithm family (`Counting sort 계열: C Timsort 에 불리,
+ratio≫0.9 — 기각`). v0.5.2's measurement showed multi-cycle could not
+beat cycle 1 on hard tasks; v0.6 (Judge hints) + v0.7 (Plan honors
+hints) + v0.7.2 (cycle 1 byte-identical to v0.6, no constraint
+overhead on fresh tasks) is the path that finally closed the loop.
+
+Free-form mode + auto-rubric also confirmed: `agent-loop run "extract_emails ..."`
+on `composer-2` produces a clean `re.findall + sorted(set(...))` solution,
+weighted_score `0.93` from a 3-axis LLM rubric (correctness / edge_cases /
+code_quality) the loop generated automatically.
+
+211 unit tests passing. 21 commits on `main`.
+
+---
+
+**v0.7.0** (superseded by v0.7.2) — Plan prompt enhancement (`prior_judge_hint` injection +
 Reasoning Constraints in `plan.md`). v0.6 made the Judge produce concrete
 algorithmic hints like "expand-around-center O(n²) → Manacher O(n)" but
 the Plan worker had no awareness of those hints, so cycle 2 / 3
@@ -92,6 +122,27 @@ keys and are exercised by mocked tests only.
 
 See `docs/plan-v0.1.md` for the full spec, `docs/architecture.md` for the layered design, and
 `progress.txt` for build history.
+
+## Related project
+
+If you live inside Claude Code and want the same R->P->I->V->J loop as a
+**Claude Code Skill** (Claude only, single phase model, no install required
+beyond the plugin), see [agent-loop-plugin](https://github.com/dbscjf0000-web/agent-loop-plugin).
+`agent-loop-cli` is the standalone re-implementation of that plugin: same
+loop semantics, but multi-vendor (cursor / claude / gemini / litellm),
+`pip`-installable, and usable from any shell or via MCP from any AI tool.
+
+| | agent-loop-plugin | agent-loop-cli |
+|---|---|---|
+| Runs in | Claude Code | any shell, MCP-callable |
+| Models | Claude only | cursor / claude / gemini / litellm |
+| Phases per model | one | per-phase override |
+| State | `.agent_loop/` files | `.agent_loop/` files |
+| Rollback / resume | yes | yes |
+| Multi-judge consensus | no | yes (v0.3) |
+| Multi-strategy plan | no | yes (v0.3) |
+| Auto-rubric | no | yes (v0.4.1) |
+| MCP server | no | yes (v0.5) |
 
 ## Why
 
