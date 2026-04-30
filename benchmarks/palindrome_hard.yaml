@@ -1,0 +1,53 @@
+name: longest-palindrome-hard
+category: string
+description: |
+  Hard variant of the palindrome benchmark: 50K-char input forces an
+  algorithmic pivot (O(n²) expand-around-center cannot meet the time
+  budget; only Manacher / suffix-tree-class O(n) survives). Designed
+  to stress the agent-loop's "Judge → Plan family pivot" path so the
+  paired baseline-vs-loop comparison can show whether the loop
+  actually closes the gap on tasks where a single shot misses.
+
+task: |
+  Implement `longest_palindrome(s: str) -> str` that returns the longest
+  palindromic substring of `s`. Ties: leftmost wins. Empty input -> "".
+  Inputs include adversarial 50,000-char strings; the function must
+  finish well under the threshold below — quadratic algorithms will
+  time out, so Manacher's algorithm (or another O(n)/O(n log n)
+  approach) is required.
+
+success_criteria:
+  - axis: correctness
+    weight: 0.6
+    test: |
+      assert longest_palindrome("") == ""
+      assert longest_palindrome("a") == "a"
+      assert longest_palindrome("ab") in ("a", "b")
+      assert longest_palindrome("babad") in ("bab", "aba")
+      assert longest_palindrome("cbbd") == "bb"
+      assert longest_palindrome("racecar") == "racecar"
+      assert longest_palindrome("abacdfgdcaba") == "aba"
+      # Hard inputs: huge strings the function must handle quickly.
+      s = "a" * 50000
+      assert longest_palindrome(s) == s
+      # Pathological case for naive O(n²) implementations.
+      s = ("ab" * 25000) + "a"
+      out = longest_palindrome(s)
+      assert len(out) == len(s)
+  - axis: performance
+    weight: 0.4
+    target: "On 50,000-char input, finishes in <= 0.5s (forces O(n) algorithm)"
+    setup: |
+      from solution import *
+      s_aaaa = "a" * 50000
+      s_abab = ("ab" * 25000) + "a"
+    stmt: "_ = longest_palindrome(s_aaaa); _ = longest_palindrome(s_abab)"
+    measure: wall_clock_seconds
+    threshold: 0.5
+    repeats: 3
+    timeout: 30
+
+budget:
+  max_cycles: 3
+  max_redo: 2
+  max_usd: 1.0

@@ -12,3 +12,4 @@ build/
 
 # Local live-verify configs
 al_*.toml
+output/

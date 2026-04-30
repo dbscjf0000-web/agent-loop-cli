@@ -402,17 +402,123 @@ def _call_gemini_cli(
 
 
 # ---------------------------------------------------------------------------
+# codex CLI (OpenAI Codex)
+# ---------------------------------------------------------------------------
+
+def _is_codex_model(model: str) -> bool:
+    if not model:
+        return False
+    return model == "codex" or model.startswith("codex/")
+
+
+def _codex_model_arg(model: str) -> str | None:
+    """Translate `codex/<m>` into the `-m` value, else None (use codex default).
+
+    Bare `codex` returns None so the CLI uses whatever model is set in
+    ``~/.codex/config.toml`` (typically gpt-5.x). Pass an explicit
+    ``codex/gpt-5.2-codex-high`` etc. to override per-phase.
+    """
+    if model == "codex":
+        return None
+    return model.split("/", 1)[1] if "/" in model else None
+
+
+def _call_codex_cli(
+    prompt: str,
+    system: str = "",
+    *,
+    model: str | None = None,
+    workspace: Path | str | None = None,
+    timeout: float = 600.0,
+) -> ModelResponse:
+    """Invoke the local `codex` CLI in non-interactive (`exec`) mode.
+
+    Flags: ``codex exec --skip-git-repo-check
+    --dangerously-bypass-approvals-and-sandbox -`` with prompt on stdin.
+
+    The bypass flag is required because codex's default sandbox blocks
+    workspace writes — agent-loop's I phase needs to drop ``solution.py``
+    into ``workspace/``. Same trust posture as the cursor/gemini wrappers
+    (``--force --trust`` / ``--yolo --skip-trust``); we run inside a
+    user-controlled task workspace, not an exposed shell.
+
+    cost_usd is reported as 0 because codex CLI subscription billing is
+    opaque (matches the cursor/gemini convention).
+    """
+    cli = shutil.which("codex")
+    if cli is None:
+        raise RuntimeError(
+            "codex CLI not found on PATH. "
+            "Install with `npm install -g @openai/codex` and run `codex login` once."
+        )
+
+    rendered = (
+        f"# System\n\n{system.strip()}\n\n# Task\n\n{prompt.strip()}"
+        if system.strip()
+        else prompt
+    )
+
+    cmd: list[str] = [
+        cli,
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-",
+    ]
+    if model:
+        cmd.extend(["-m", model])
+
+    cwd = str(workspace) if workspace is not None else None
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=rendered,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            cwd=cwd,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"codex CLI timed out after {timeout:.0f}s "
+            f"(model={model or 'default'}, workspace={workspace})"
+        ) from e
+    latency_s = time.monotonic() - started
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-2000:]
+        raise RuntimeError(
+            f"codex CLI failed (rc={proc.returncode}, model={model or 'default'}): {stderr_tail}"
+        )
+
+    text = (proc.stdout or "").rstrip("\n")
+    return ModelResponse(
+        text=text,
+        prompt_tokens=max(1, len(rendered) // 4),
+        completion_tokens=max(0, len(text) // 4),
+        cost_usd=0.0,
+        latency_s=latency_s,
+        model=f"codex/{model}" if model else "codex",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI provider dispatch helper
 # ---------------------------------------------------------------------------
 
 def _cli_provider(model: str) -> str | None:
-    """Return ``"cursor"`` / ``"claude"`` / ``"gemini"`` for CLI-routed models, else None."""
+    """Return ``"cursor"`` / ``"claude"`` / ``"gemini"`` / ``"codex"`` for CLI-routed models, else None."""
     if _is_cursor_model(model):
         return "cursor"
     if _is_claude_model(model):
         return "claude"
     if _is_gemini_model(model):
         return "gemini"
+    if _is_codex_model(model):
+        return "codex"
     return None
 
 
@@ -529,6 +635,14 @@ def call_model(
                 prompt,
                 system,
                 model=_gemini_model_arg(model),
+                workspace=workspace,
+                timeout=timeout,
+            )
+        if provider == "codex":
+            return _call_codex_cli(
+                prompt,
+                system,
+                model=_codex_model_arg(model),
                 workspace=workspace,
                 timeout=timeout,
             )
