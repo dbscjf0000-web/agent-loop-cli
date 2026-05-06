@@ -46,11 +46,50 @@ Research 결과를 받아 **구현 계획서**(`plan.md`)를 만듭니다.
 - (선택한 접근의 핵심 아이디어 + 시간/공간 복잡도)
 - 대안과 기각 이유 (한 줄씩)
 
-## 3. 구현 단계
-1. ...
-2. ...
-3. ...
-(각 단계 한 줄로)
+## 3. Sub-tasks
+
+작업을 **검증 가능한 sub-task로 분해**합니다. 각 sub-task는 다음 5 필드를 모두 가져야 합니다:
+
+```
+### subtask-<번호>: <짧은 이름>
+- goal: 무엇을 만드는가 (1줄)
+- acceptance: 어떤 결과여야 하는가 (구체적 예시 1~3개)
+- verifier: pytest | rule | llm_rubric  (택 1)
+- check_hint: 검증 시 다뤄야 할 측면 (도메인 무관)
+- depends_on: 다른 sub-task id 참조 (없으면 빈 줄)
+```
+
+### verifier 선택 규칙
+- **pytest**: 코드 task — Python 함수가 산출되어 assert 가능할 때
+- **rule**: 결정론적 텍스트/구조 검증 (논문 섹션 존재, JSON 스키마, regex 매치 등)
+- **llm_rubric**: 위 둘로 안 되는 의미 평가 (논리 흐름, 글의 명료성 등)
+
+예 (코드 task):
+```
+### subtask-1: parse_input
+- goal: 공백 구분 문자열을 정수 리스트로 변환
+- acceptance:
+    parse("1 2 3") == [1, 2, 3]
+    parse("") == []
+- verifier: pytest
+- check_hint: empty / 음수 / 비숫자 → ValueError
+- depends_on:
+```
+
+예 (논문 task):
+```
+### subtask-2: 초록 작성
+- goal: 250자 이내 5문장 초록
+- acceptance: 본문의 핵심 주장이 초록에 명시
+- verifier: rule
+- check_hint: section="abstract" 존재, len ≤ 250자, 문장 ≤ 5개
+- depends_on:
+```
+
+원칙:
+- sub-task 1개 = "단일 책임" + "독립 검증 가능"
+- 단순 task는 sub-task 1~2개로 충분 (gold-plating 금지)
+- verifier=pytest일 때만 다음 단계(I)가 test_subtask*.py를 별도 작성
 
 ## 4. 검증 계획
 - 정확성: 어떤 입력에 어떤 출력이 나와야 하는가

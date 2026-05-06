@@ -41,6 +41,28 @@
 ### Prior cycles (지금까지의 시도 — v0.6)
 {prior_cycles}
 
+## Sub-task Verifier Audit (Step D, TDD 통합)
+
+`solution.json` 의 `subtask_verify` 섹션이 있다면, 다음 패턴을 감시하세요:
+
+1. **약한 검증 의심**: `weighted_score >= 0.85` 인데 `subtask_verify` 항목이
+   대부분 `passed=true` 면, 테스트가 너무 약한 것일 수 있습니다.
+   증거: assert 1~2개짜리 trivial 테스트, edge case 미커버.
+   조치: `reason` 에 `"weak_verifier_suspicion"` 명시 + `action="redo_P"` 권장
+   (P 가 더 엄격한 sub-task 분해를 다시 하도록).
+
+2. **검증 ↔ rubric 격차**: `subtask_verify` 가 모두 fail 인데 rubric
+   `weighted_score >= 0.6` 이면, rubric 채점이 헐겁거나 sub-task 분해가
+   잘못된 것입니다. `reason` 에 `"verifier_rubric_mismatch"` 명시.
+
+3. **누락된 verifier**: `subtask_verify` 항목 중 `verifier="(none)"` 또는
+   `passed=false detail="missing test file"` 다수면, I 단계가 P 의
+   sub-task 를 무시한 신호. `action="redo_P"` 또는 `redo_I 의도` (단,
+   현재 행동 집합엔 `redo_I` 없으므로 `redo_R` 차선).
+
+이 audit 은 기존 `weighted_score` 비교를 대체하지 않습니다 — **score 가
+판정 1순위, audit 는 reason/hint 보조**입니다.
+
 ## Reasoning Constraints (v0.6)
 
 이 제약은 **multi-cycle 의 의미를 살리기 위한 강제 규칙** 입니다.

@@ -51,6 +51,22 @@ _FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 
+import logging as _logging
+log = _logging.getLogger(__name__)
+
+
+def _count_plan_subtasks(plan_text: str) -> int:
+    """Count occurrences of `### subtask-` headers in plan.md (case-insensitive).
+
+    Returns 0 if plan does not use the structured sub-task format — then
+    the soft-check is silently skipped.
+    """
+    import re as _re
+    if not plan_text:
+        return 0
+    return len(_re.findall(r"^###\s+subtask-", plan_text, flags=_re.IGNORECASE | _re.MULTILINE))
+
+
 def _extract_python(text: str) -> tuple[str, str]:
     """Return (code, prose).
 
@@ -64,6 +80,33 @@ def _extract_python(text: str) -> tuple[str, str]:
     code = m.group(1).rstrip() + "\n"
     prose = (text[: m.start()] + text[m.end() :]).strip()
     return code, prose
+
+
+def _extract_test_subtask_files(text: str) -> dict[str, str]:
+    """TDD integration (Step B): find all subsequent ``python`` blocks whose
+    first non-blank line is ``# file: test_subtask*.py`` and return a
+    ``{filename: code}`` mapping.
+
+    Backward compat: blocks without the magic header are ignored, so existing
+    single-block implement outputs continue to work unchanged.
+    """
+    import re as _re
+    out: dict[str, str] = {}
+    pattern = _re.compile(r"```python\s*\n(.*?)```", _re.DOTALL)
+    blocks = pattern.findall(text)
+    if len(blocks) <= 1:
+        return out  # only solution.py, nothing else
+    for raw in blocks[1:]:  # skip first (= solution.py)
+        body = raw.lstrip("\n")
+        first_line = body.split("\n", 1)[0].strip() if body else ""
+        m = _re.match(r"#\s*file:\s*(test_subtask[A-Za-z0-9_]*\.py)\s*$", first_line)
+        if not m:
+            continue
+        fname = m.group(1)
+        # Drop the header line; the rest is the test source.
+        rest = body.split("\n", 1)[1] if "\n" in body else ""
+        out[fname] = rest.rstrip() + "\n"
+    return out
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -749,6 +792,14 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     )
     ws = task_dir.workspace_path()
     ws.mkdir(parents=True, exist_ok=True)
+    # Codex review fix #5: clear stale test_subtask*.py from previous cycle
+    # so a deleted/renamed sub-task does not silently linger and get
+    # promoted to the regression bank.
+    for stale in ws.glob("test_subtask*.py"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     resp = call_model(
         "implement",
         prompt,
@@ -760,6 +811,24 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     code, prose = _extract_python(resp.text)
     if code:
         (ws / "solution.py").write_text(code, encoding="utf-8")
+    # TDD integration (Step B): save any sub-task test files declared via
+    # `# file: test_subtaskN.py` headers in additional code blocks.
+    test_files = _extract_test_subtask_files(resp.text)
+    for fname, fcode in test_files.items():
+        (ws / fname).write_text(fcode, encoding="utf-8")
+    # Step B (Codex review #4): soft-check warnings — never fail the run.
+    if code and ("def test_" in code or "# file:" in code):
+        log.warning(
+            "implement: first code block looks test-like — "
+            "did you mean to put solution.py first?"
+        )
+    plan_subtasks = _count_plan_subtasks(plan)
+    if plan_subtasks > 0 and len(test_files) < plan_subtasks:
+        log.warning(
+            "implement: plan.md declares %d sub-tasks but only %d "
+            "test_subtask*.py files were extracted",
+            plan_subtasks, len(test_files),
+        )
     task_dir.write_artifact("execution_log.md", prose or resp.text)
     ContextEngine(task_dir).append_history(
         {
@@ -810,6 +879,22 @@ def _run_verify_with_rubric(task_dir: TaskDir, config: Config, rubric_path: Path
     result = engine.evaluate(rubric)
     payload = result_to_dict(result)
     payload["evidence"] = result.summary  # backward-compat surface
+
+    # Step C — sub-task verifier dispatcher (TDD integration). Adds a
+    # ``subtask_verify`` section to solution.json. Failures here do NOT
+    # change weighted_score (rubric remains the score authority); they
+    # surface as evidence for J to audit.
+    try:
+        from agent_loop.subtask_verify import (
+            run_subtask_verifications, result_to_dict as st_to_dict,
+        )
+        plan_text = _read_or(task_dir, "plan.md", "")
+        st_results = run_subtask_verifications(plan_text, task_dir.workspace_path())
+        if st_results:
+            payload["subtask_verify"] = [st_to_dict(r) for r in st_results]
+    except Exception as e:  # never break verify on TDD bookkeeping
+        payload["subtask_verify_error"] = f"{type(e).__name__}: {e}"
+
     task_dir.write_artifact("solution.json", payload)
 
     ContextEngine(task_dir).append_history(
