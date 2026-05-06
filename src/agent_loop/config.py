@@ -130,6 +130,19 @@ class Runtime(BaseModel):
     # verifier for free-form tasks).
     auto_rubric: bool = True
 
+    # Phase 1 (2026-05-06) — Stagnation detector
+    # 같은 weighted_score가 ``stagnation_threshold + 1`` cycle 연속 반복되면
+    # 자동 stop. 0 또는 None이면 비활성. Env override:
+    # ``AGENT_LOOP_DISABLE_STAGNATION=1``로 일괄 OFF.
+    stagnation_threshold: int = 2
+
+    # Phase 1 (2026-05-06) — TDD regression bank
+    # cycle에서 ``regression_promote_score`` 이상 달성 시 해당 task의
+    # acceptance test가 ``tests/regression/<task_id>_<ts>.py``로 자동 복사된다.
+    # 0 또는 None이면 비활성. Env override:
+    # ``AGENT_LOOP_DISABLE_REGRESSION_BANK=1``.
+    regression_promote_score: float = 0.95
+
     def cli_timeout_for(self, phase: str) -> int:
         """Return the effective subprocess timeout (seconds) for ``phase``.
 

@@ -120,6 +120,22 @@ class TaskDir:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    # --- decision log (Phase 1) -----------------------------------------
+    def decision_log_path(self) -> Path:
+        """Append-only ISO-8601 timestamped phase decisions (1 file per task)."""
+        return self.path / "decision.log"
+
+    def append_decision(self, phase: str, **fields: Any) -> None:
+        import os
+        from datetime import datetime, timezone
+        if os.environ.get("AGENT_LOOP_DISABLE_DECISION_LOG", "").lower() in {"1", "true", "yes"}:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        kv = " ".join(f"{k}={v}" for k, v in fields.items())
+        line = f"[{ts}] {phase} {kv}\n".rstrip() + "\n"
+        with self.decision_log_path().open("a", encoding="utf-8") as f:
+            f.write(line)
+
     # --- checkpoints -----------------------------------------------------
     def save_checkpoint(self, cycle: int, phase: str, payload: dict[str, Any]) -> Path:
         name = f"cycle_{cycle:03d}_phase_{phase}.json"

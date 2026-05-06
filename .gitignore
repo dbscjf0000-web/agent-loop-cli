@@ -1,4 +1,8 @@
 .agent_loop/
+.agent_loop_*/
+
+# Auto-populated by Phase 1 regression bank — local artifacts only
+tests/regression/
 __pycache__/
 *.pyc
 *.egg-info/
