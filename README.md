@@ -7,6 +7,48 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.11.0** — **GIGO defense** (R spec audit + J rubric suspicion).
+Closes the loophole that let wrong task/rubric assumptions pass through
+all 5 phases (e.g. NMI manuscript case where a wrongly-asserted
+"Introduction heading required" axis verified as PASS even though the
+real journal house style omits it). R now writes a `## 7. Spec Audit`
+section per cycle (`[OK]` / `[CONCERN]` / `[UNKNOWN]` per axis with
+external source); J watches for 4 patterns that suggest the rubric
+itself is wrong and emits `action="redo_P"` + a `rubric concern: ...`
+hint so the next Plan surfaces the issue to the user. No new phase, no
+new action — uses existing `redo_P` so cycle-to-cycle score comparison
+(Phase 1 best-so-far / stagnation) still works. 260 unit tests pass;
+`bench binary_search` on `gemini-2.5-flash` produced the audit
+section with `[OK] correctness` / `[OK] complexity` and J correctly
+stayed silent (no concerns) for a clean 1.000 stop.
+
+**v0.10.0** — **Phase 2: sub-task TDD integration** (P/I/V/J).
+Generalizes the loop so each sub-task carries its own verifier choice.
+P now structures sub-tasks with 5 fields (`goal`, `acceptance`,
+`verifier`, `check_hint`, `depends_on`); I emits per-sub-task tests in
+extra ```python``` blocks marked `# file: test_subtaskN.py`; V dispatches
+each by `verifier` type — `pytest` (workspace test), `rule` (text /
+regex / section / json clauses), or `llm_rubric` (deferred to existing
+axis path). Results land in `solution.json` under `subtask_verify` but
+never change `weighted_score` (rubric stays the score authority). J adds
+`weak_verifier_suspicion` / `verifier_rubric_mismatch` audit. Live
+`sort_tuning` cycles=3 (claude+gemini): all four steps activated
+end-to-end, score 0.60 → 0.949 (+58%).
+
+**v0.9.0** — **Phase 1: local-optima safety nets**. Four orthogonal,
+prompt-free additions to the loop: (1) **stagnation detector** — same
+weighted_score for N+1 cycles in a row triggers an early stop; (2)
+**best-so-far commit** gated on `judge.better=true` so a rolled-back
+cycle can never overwrite a higher historical record (resume-safe via
+`decision.log` replay); (3) **TDD regression bank** — accepted cycles
+with score ≥ 0.95 auto-copy `workspace/test_*.py` to
+`tests/regression/<task>_c<cycle>_<ts>_*.py` (path resolves to repo
+root via `pyproject.toml`/`tests/`, never arbitrary cwd); (4)
+**append-only `decision.log`** so every phase's resolved action is
+recoverable across resumes. Live `sort_tuning` (claude+gemini) cycle
+2=0.949 (best) preserved when cycle 3 regressed to 0.946 — exactly the
+case that motivated the gate.
+
 **v0.7.2** — Codex review fixes for v0.7.0 (cycle 1 prompt diet) +
 **first proven multi-cycle improvement** in agent-loop-cli history.
 Live verified with `cursor/composer-2`, `--cycles 3`, ground-truth
