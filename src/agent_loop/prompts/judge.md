@@ -41,6 +41,33 @@
 ### Prior cycles (지금까지의 시도 — v0.6)
 {prior_cycles}
 
+## ★ Rubric Suspicion Audit (GIGO 방어)
+
+R 단계의 `## 7. Spec Audit` 섹션 또는 사이클 진행 중 다음 패턴이 보이면
+**rubric 자체가 외부 사실과 어긋날 수 있음**을 의심해야 합니다.
+
+신호:
+1. 같은 axis가 모든 cycle에서 항상 100% pass인데 산출물 품질이 의심스러움
+   → axis 정의가 너무 헐겁거나 잘못된 가정 가능성.
+2. `subtask_verify` 결과 모두 pass인데 `weighted_score < 0.6`
+   → rubric 채점 기준과 sub-task 검증이 따로 노는 신호.
+3. R 단계 findings에 `[CONCERN]` 또는 `[UNKNOWN]` 항목이 있는데
+   이전 cycle hint에서 다뤄지지 않음.
+4. 사용자가 rubric 작성 시 일반화된 가정 (예: "일반 학술 양식") 을 사용했는데
+   task에 특정 표준 (예: "Nature Methods house style") 명시.
+
+조치:
+- `action="redo_P"` 선택 (기존 action 그대로 사용 — 신규 action 불필요).
+- `hint` 에 다음 형식으로 명시:
+    `"rubric concern: <axis 이름> — <외부 사실/표준> 과 어긋남.
+      P는 plan.md 에 'rubric_concern' 섹션을 추가해 사용자가 sign-off 전에
+      이 점을 검토하도록 명시할 것. 구현은 plan에 명시된 채로 진행하되,
+      산출물에 해당 부분을 보수적으로 처리."`
+- `reason` 에 `"rubric_suspicion"` 키워드 명시.
+
+이 audit은 rubric 자체를 자동 수정하지 않습니다 — 책임은 사용자에게 명시적으로
+드러내고, 다음 cycle의 P가 plan에 의심을 박아두는 것까지가 J의 역할입니다.
+
 ## Sub-task Verifier Audit (Step D, TDD 통합)
 
 `solution.json` 의 `subtask_verify` 섹션이 있다면, 다음 패턴을 감시하세요:
