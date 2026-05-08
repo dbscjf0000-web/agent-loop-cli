@@ -111,6 +111,53 @@ def test_spec_file_unsafe_path_rejected(tmp_path: Path, monkeypatch: pytest.Monk
     assert "unsafe" in score.evidence
 
 
+def test_spec_file_list_concatenates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real-world catch: meta-tasks producing both task.md and rubric.json
+    need a single rubric axis to evaluate against both files. Previously
+    the LLM emitted ``file: "both"`` (a string!) which became ``(no both)``
+    and tanked the score. Multi-file list now supported."""
+    td = _td(tmp_path)
+    (td.workspace_path() / "task.md").write_text("# Task\nbuild X\n", encoding="utf-8")
+    (td.workspace_path() / "rubric.json").write_text(
+        '{"axes": []}\n', encoding="utf-8"
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr("agent_loop.models.call_model", _stub_call_model(captured))
+
+    score = run_llm_rubric(
+        name="quality",
+        spec={
+            "weight": 1.0,
+            "criterion": "are task and rubric internally consistent",
+            "file": ["task.md", "rubric.json"],
+        },
+        task_dir=td, config=Config(),
+    )
+    assert score.score == pytest.approx(0.85)
+    assert "===== task.md =====" in captured["prompt"]
+    assert "===== rubric.json =====" in captured["prompt"]
+    assert "build X" in captured["prompt"]
+    assert '"axes": []' in captured["prompt"]
+
+
+def test_spec_file_list_with_unsafe_member_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    td = _td(tmp_path)
+    monkeypatch.setattr("agent_loop.models.call_model", _stub_call_model({}))
+    score = run_llm_rubric(
+        name="x",
+        spec={
+            "weight": 1.0,
+            "criterion": "x",
+            "file": ["task.md", "../etc/passwd"],
+        },
+        task_dir=td, config=Config(),
+    )
+    assert score.score == 0.0
+    assert "unsafe" in score.evidence
+
+
 def test_missing_file_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     td = _td(tmp_path)
     captured: dict[str, Any] = {}

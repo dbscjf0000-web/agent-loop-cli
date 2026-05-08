@@ -77,27 +77,64 @@ def run_llm_rubric(
     weight = float(spec.get("weight", 1.0) or 0.0)
     criterion = str(spec.get("criterion") or spec.get("description") or "code quality")
 
-    # v0.12.0 follow-up — non-code rubric axes (manuscript, spec, …) need to
-    # see the actual artifact, not a missing solution.py. Same `spec["file"]`
-    # contract as pytest_runner; default keeps backward-compat.
-    src_file = str(spec.get("file") or "solution.py")
+    # v0.12.0 — accept either a single filename or a list of filenames.
+    # Multi-file lets a single rubric axis evaluate against several artifacts
+    # together (e.g. ``file: ["task.md", "rubric.json"]`` for a meta-task that
+    # builds both). The previous single-string contract silently broke when
+    # an LLM emitted ``file: "both"`` or a list — score=0 with no signal.
+    raw_file = spec.get("file") or "solution.py"
+    src_files: list[str]
+    if isinstance(raw_file, list):
+        src_files = [str(x) for x in raw_file if x]
+        if not src_files:
+            src_files = ["solution.py"]
+    else:
+        src_files = [str(raw_file)]
+
     from agent_loop.workers import _is_safe_workspace_filename
-    if not _is_safe_workspace_filename(src_file):
-        return AxisScore(
-            name=name, score=0.0, weight=weight, evaluator="llm_rubric",
-            evidence=f"unsafe spec.file: {src_file!r}", is_ground_truth=False,
-        )
-    sol = task_dir.workspace_path() / src_file
-    source = sol.read_text(encoding="utf-8") if sol.exists() else f"(no {src_file})"
+    for fname in src_files:
+        if not _is_safe_workspace_filename(fname):
+            return AxisScore(
+                name=name, score=0.0, weight=weight, evaluator="llm_rubric",
+                evidence=f"unsafe spec.file: {fname!r}", is_ground_truth=False,
+            )
+
+    # Read each file; missing files become a placeholder so the LLM at least
+    # sees which artifact was expected. Codex review fixes:
+    #   • per-file byte cap so a single huge artifact cannot blow the context
+    #   • errors="replace" so non-UTF-8 bytes don't crash the evaluator
+    _PER_FILE_CAP = 8000
+    parts: list[str] = []
+    ext_kinds: set[str] = set()
+    for fname in src_files:
+        p = task_dir.workspace_path() / fname
+        if p.exists():
+            try:
+                body = p.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                body = f"(read error on {fname}: {exc})"
+            if len(body) > _PER_FILE_CAP:
+                body = body[:_PER_FILE_CAP] + f"\n... [truncated {len(body) - _PER_FILE_CAP} chars]"
+        else:
+            body = f"(no {fname})"
+        if len(src_files) == 1:
+            parts.append(body)
+        else:
+            parts.append(f"===== {fname} =====\n{body}")
+        ext_kinds.add((fname.rsplit(".", 1)[-1].lower() if "." in fname else ""))
+    source = "\n\n".join(parts)
+
     # Adapt prompt language to the artifact kind so the model doesn't apply a
-    # code-style rubric to a markdown/json/text file.
-    ext = src_file.rsplit(".", 1)[-1].lower() if "." in src_file else ""
-    source_kind = {
+    # code-style rubric to a markdown/json/text file. With multiple files we
+    # fall back to "artifact" unless every file shares the same kind.
+    _kind_map = {
         "py": "code", "js": "code", "ts": "code", "rb": "code", "go": "code",
         "md": "document", "txt": "document", "rst": "document",
         "json": "data", "yaml": "data", "yml": "data", "toml": "data",
         "html": "document", "tex": "document",
-    }.get(ext, "artifact")
+    }
+    kinds = {_kind_map.get(e, "artifact") for e in ext_kinds}
+    source_kind = kinds.pop() if len(kinds) == 1 else "artifact"
 
     prompt = _build_prompt(name, criterion, source, source_kind)
     try:
