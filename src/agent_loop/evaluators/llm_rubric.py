@@ -50,14 +50,14 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError(f"could not parse JSON (len={len(s)})")
 
 
-def _build_prompt(name: str, criterion: str, source: str) -> str:
+def _build_prompt(name: str, criterion: str, source: str, source_kind: str = "code") -> str:
     return (
-        f"Score the following code on the rubric axis '{name}': {criterion}\n\n"
+        f"Score the following {source_kind} on the rubric axis '{name}': {criterion}\n\n"
         "Output a single JSON object with exactly two keys:\n"
         '  "score":    a float in [0, 1]\n'
         '  "evidence": a one-sentence justification\n\n'
         "Respond with JSON only.\n\n"
-        "===== code =====\n"
+        f"===== {source_kind} =====\n"
         f"{source[:6000]}\n"
         "===== end =====\n"
     )
@@ -77,10 +77,29 @@ def run_llm_rubric(
     weight = float(spec.get("weight", 1.0) or 0.0)
     criterion = str(spec.get("criterion") or spec.get("description") or "code quality")
 
-    sol = task_dir.workspace_path() / "solution.py"
-    source = sol.read_text(encoding="utf-8") if sol.exists() else "(no solution.py)"
+    # v0.12.0 follow-up — non-code rubric axes (manuscript, spec, …) need to
+    # see the actual artifact, not a missing solution.py. Same `spec["file"]`
+    # contract as pytest_runner; default keeps backward-compat.
+    src_file = str(spec.get("file") or "solution.py")
+    from agent_loop.workers import _is_safe_workspace_filename
+    if not _is_safe_workspace_filename(src_file):
+        return AxisScore(
+            name=name, score=0.0, weight=weight, evaluator="llm_rubric",
+            evidence=f"unsafe spec.file: {src_file!r}", is_ground_truth=False,
+        )
+    sol = task_dir.workspace_path() / src_file
+    source = sol.read_text(encoding="utf-8") if sol.exists() else f"(no {src_file})"
+    # Adapt prompt language to the artifact kind so the model doesn't apply a
+    # code-style rubric to a markdown/json/text file.
+    ext = src_file.rsplit(".", 1)[-1].lower() if "." in src_file else ""
+    source_kind = {
+        "py": "code", "js": "code", "ts": "code", "rb": "code", "go": "code",
+        "md": "document", "txt": "document", "rst": "document",
+        "json": "data", "yaml": "data", "yml": "data", "toml": "data",
+        "html": "document", "tex": "document",
+    }.get(ext, "artifact")
 
-    prompt = _build_prompt(name, criterion, source)
+    prompt = _build_prompt(name, criterion, source, source_kind)
     try:
         resp = call_model(
             "verify",
