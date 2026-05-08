@@ -27,10 +27,15 @@ policy is shared between writer and reader. The first live non-code
 bench (`manuscript_polish` on `gemini-2.5-flash`) finished cycle 1 at
 **weighted_score 1.000** — `workspace/manuscript.md` written correctly,
 no `solution.py` artifact, structure (ast_grep) and writing_quality
-(llm_rubric) both 1.00. A follow-up fix made the extractor leniently
-strip a leading `workspace/` or `./` from headers so an LLM that
-echoes the plan's path prefix doesn't silently produce an empty
-workspace. **284 tests pass** (24 new v0.12 tests + 260 prior).
+(llm_rubric) both 1.00. Follow-up fixes: (1) the extractor leniently
+strips a leading `workspace/` or `./` from headers so an LLM echoing
+plan's path prefix doesn't silently produce an empty workspace; (2)
+external review caught that `llm_rubric` was the one evaluator left
+hardcoded to `solution.py` — fixed so all 4 evaluators (pytest,
+ast_grep, benchmark, llm_rubric) honor `spec["file"]` uniformly, and
+the LLM rubric prompt adapts its `source_kind` (code / document /
+data) to the file extension. **290 tests pass** (30 new v0.12 tests +
+260 prior).
 
 **v0.11.0** — **GIGO defense** (R spec audit + J rubric suspicion).
 Closes the loophole that let wrong task/rubric assumptions pass through
