@@ -23,8 +23,14 @@ accepts an optional `spec["file"]` (default `solution.py`) so rubrics
 can target non-default code entry points. Backward compat in three
 layers: headerless first `python` block still saves to `solution.py`,
 `spec["file"]` absent still loads `solution.py`, and the same filename
-policy is shared between writer and reader. 281 tests pass (21 new
-v0.12 tests + 260 prior).
+policy is shared between writer and reader. The first live non-code
+bench (`manuscript_polish` on `gemini-2.5-flash`) finished cycle 1 at
+**weighted_score 1.000** — `workspace/manuscript.md` written correctly,
+no `solution.py` artifact, structure (ast_grep) and writing_quality
+(llm_rubric) both 1.00. A follow-up fix made the extractor leniently
+strip a leading `workspace/` or `./` from headers so an LLM that
+echoes the plan's path prefix doesn't silently produce an empty
+workspace. **284 tests pass** (24 new v0.12 tests + 260 prior).
 
 **v0.11.0** — **GIGO defense** (R spec audit + J rubric suspicion).
 Closes the loophole that let wrong task/rubric assumptions pass through
