@@ -158,6 +158,68 @@ def test_spec_file_list_with_unsafe_member_rejected(
     assert "unsafe" in score.evidence
 
 
+def test_default_cap_keeps_short_files_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    td = _td(tmp_path)
+    body = "# Title\n\n" + ("paragraph. " * 200)  # ~2.4KB
+    (td.workspace_path() / "manuscript.md").write_text(body, encoding="utf-8")
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr("agent_loop.models.call_model", _stub_call_model(captured))
+
+    run_llm_rubric(
+        name="q", spec={"weight": 1.0, "criterion": "x", "file": "manuscript.md"},
+        task_dir=td, config=Config(),
+    )
+    # Short file: present in full, no truncation marker.
+    assert "paragraph." in captured["prompt"]
+    assert "[omitted" not in captured["prompt"]
+    assert "[truncated" not in captured["prompt"]
+
+
+def test_long_file_uses_head_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real-world catch (manuscript polish): a 48KB document was being
+    truncated to its first 6000 chars, hiding refs/figure legends. With
+    adaptive head+tail, both the start and the end remain visible."""
+    td = _td(tmp_path)
+    head_marker = "MARKER_HEAD_DO_NOT_LOSE"
+    tail_marker = "MARKER_TAIL_DO_NOT_LOSE"
+    middle = "x" * 80_000  # well over 1.5x default cap (32_000)
+    body = f"{head_marker}\n{middle}\n{tail_marker}"
+    (td.workspace_path() / "manuscript.md").write_text(body, encoding="utf-8")
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr("agent_loop.models.call_model", _stub_call_model(captured))
+
+    run_llm_rubric(
+        name="q", spec={"weight": 1.0, "criterion": "x", "file": "manuscript.md"},
+        task_dir=td, config=Config(),
+    )
+    # Both markers must reach the prompt; the middle "xxx..." is omitted.
+    assert head_marker in captured["prompt"]
+    assert tail_marker in captured["prompt"]
+    assert "[omitted" in captured["prompt"]
+
+
+def test_spec_max_bytes_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-axis max_bytes lets a rubric author opt into a tighter or looser
+    cap, e.g. 0 = no cap, or 4000 for a quick spot-check."""
+    td = _td(tmp_path)
+    body = "AAA" * 5_000  # 15KB
+    (td.workspace_path() / "long.md").write_text(body, encoding="utf-8")
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr("agent_loop.models.call_model", _stub_call_model(captured))
+
+    run_llm_rubric(
+        name="q",
+        spec={"weight": 1.0, "criterion": "x", "file": "long.md", "max_bytes": 1000},
+        task_dir=td, config=Config(),
+    )
+    # 15KB with cap 1000 and len > 1.5x cap → head+tail
+    assert "[omitted" in captured["prompt"]
+
+
 def test_missing_file_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     td = _td(tmp_path)
     captured: dict[str, Any] = {}
