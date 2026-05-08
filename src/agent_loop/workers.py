@@ -107,9 +107,11 @@ _GENERIC_FENCE_RE = _vre.compile(
     r"```([A-Za-z0-9_\-+]*)\s*\n(.*?)```",
     _vre.DOTALL,
 )
-# Match a `# file: <name>` header. Supports several comment styles.
+# Match a `# file: <name>` header. The name is captured permissively (slashes
+# allowed) so the extractor can strip a leading ``workspace/`` or ``./`` before
+# enforcing the strict basename policy via ``_is_safe_workspace_filename``.
 _FILE_HEADER_RE = _vre.compile(
-    r"^\s*(?:#|//|--|;|<!--|/\*)\s*file\s*:\s*([A-Za-z0-9_\-.]+)\s*(?:-->|\*/)?\s*$"
+    r"^\s*(?:#|//|--|;|<!--|/\*)\s*file\s*:\s*([A-Za-z0-9_\-./\\]+)\s*(?:-->|\*/)?\s*$"
 )
 
 
@@ -158,6 +160,15 @@ def _extract_workspace_files(text: str) -> dict[str, str]:
         if not m:
             continue
         fname = m.group(1).strip()
+        # v0.12.0 lenient parsing: LLMs often emit `# file: workspace/foo.md`
+        # because plan.md referenced the file with that prefix. We strip a
+        # leading `workspace/` (and bare `./`) so the writer-side path policy
+        # stays strict (no slashes ever saved) without forcing the LLM to
+        # mentally convert paths.
+        if fname.startswith("workspace/"):
+            fname = fname[len("workspace/"):]
+        if fname.startswith("./"):
+            fname = fname[2:]
         if not _is_safe_workspace_filename(fname):
             log.warning(
                 "implement: rejected unsafe filename in # file: header: %r", fname

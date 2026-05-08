@@ -1,0 +1,47 @@
+name: manuscript-polish
+category: manuscript
+description: |
+  Polish a rough markdown draft into a structured short article.
+  Tests v0.12.0 generalized output contract: I phase must produce
+  workspace/manuscript.md (NOT solution.py).
+
+task: |
+  아래 거친 초안을 받아 구조화된 짧은 기사 `manuscript.md`로 다듬어주세요.
+
+  ## 산출물
+  - `workspace/manuscript.md` 단 1개 파일
+  - 한국어 또는 영어 OK
+  - 약 200~400 단어
+
+  ## 거친 초안
+  ```
+  AI agent loop 을 우리는 만들었음. R P I V J 라는 5단계.
+  코드 task 는 잘 됐는데 manuscript 같은 건 안 됨.
+  v0.12 에서 이걸 고쳤음 — # file: 헤더로 산출물 일반화.
+
+  결과 280개 테스트 통과. 코드 task 변경 없음.
+  앞으로 논문 polish, task.md 생성 같은 걸 자동화할 수 있음.
+  ```
+
+  ## 요구 형식 (manuscript.md 안에 모두 포함)
+  - 1단계 헤더 `# Title` 1줄
+  - `## Abstract`, `## Introduction`, `## What changed`, `## Conclusion` 섹션 모두
+  - 본문 어디엔가 `v0.12` 키워드 등장
+
+success_criteria:
+  - axis: structure_check
+    weight: 0.5
+    rule: "`## Abstract`_count>=1; `## Introduction`_count>=1; `## What changed`_count>=1; `## Conclusion`_count>=1; `v0.12` in"
+    file: manuscript.md
+  - axis: writing_quality
+    weight: 0.5
+    criterion: |
+      manuscript.md 의 글이 (1) 자연스럽고 (2) 거친 초안의 핵심 내용을 보존하면서
+      (3) 구조화된 학술 양식 흐름(Abstract → Intro → What changed → Conclusion)을
+      따르는지 0.0~1.0 점수로 평가하세요. 너무 짧거나(<100 단어) 초안과 의미가
+      다르면 감점.
+
+budget:
+  max_cycles: 2
+  max_redo: 1
+  max_usd: 0.3

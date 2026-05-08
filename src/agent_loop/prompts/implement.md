@@ -44,7 +44,8 @@ Plan을 받아 **실제 산출물**을 작성합니다.
 
 규칙:
 - `<lang>`: python / markdown / json / yaml / text / html 등 산출물 종류에 맞게.
-- `<파일명>`: Plan의 `## 1. 산출물` 섹션에 명시된 정확한 이름.
+- `<파일명>`: **basename만** — Plan에 `workspace/foo.md` 라고 적혀 있어도
+  헤더에는 `# file: foo.md` 처럼 폴더 prefix 없이 적으세요.
   허용 문자: `A-Z a-z 0-9 _ - .` (디렉토리 분리자 `/` `\` 금지, `..` 금지).
 - 한 응답에 여러 파일 가능 — 각각 별도 block.
 - 헤더 없는 첫 ```python``` 블록은 backward-compat으로 `solution.py`에 저장됩니다

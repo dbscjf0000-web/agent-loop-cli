@@ -182,6 +182,45 @@ console.log("hi");
     assert "console.log" in files["app.js"]
 
 
+def test_workspace_prefix_stripped() -> None:
+    """LLMs often emit `# file: workspace/foo.md` when plan referenced the
+    full path. The extractor strips this leniently."""
+    src = """
+```markdown
+# file: workspace/manuscript.md
+# Title
+content
+```
+"""
+    files = _extract_workspace_files(src)
+    assert "manuscript.md" in files
+    assert "workspace/manuscript.md" not in files
+    assert "# Title" in files["manuscript.md"]
+
+
+def test_dotslash_prefix_stripped() -> None:
+    src = """
+```python
+# file: ./solution.py
+def f(): pass
+```
+"""
+    files = _extract_workspace_files(src)
+    assert "solution.py" in files
+
+
+def test_traversal_after_strip_still_blocked() -> None:
+    """Stripping `workspace/` does not whitelist further traversal."""
+    src = """
+```python
+# file: workspace/../etc/passwd
+malicious
+```
+"""
+    files = _extract_workspace_files(src)
+    assert files == {}
+
+
 def test_blank_lines_before_header_accepted() -> None:
     """Codex review fix: a fenced block whose first non-blank line is the
     `# file:` header must be accepted, even if blank lines come first."""
