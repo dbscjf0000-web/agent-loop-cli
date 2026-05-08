@@ -39,26 +39,37 @@ def _count_asserts(code: str) -> int:
     return sum(1 for ln in code.splitlines() if "assert" in ln and ln.strip())
 
 
-def _load_solution(task_dir: TaskDir) -> Any:
-    """Import ``workspace/solution.py`` as a fresh module.
+def _load_solution(task_dir: TaskDir, file_name: str = "solution.py") -> Any:
+    """Import ``workspace/<file_name>`` as a fresh module (default solution.py).
 
     A fresh module on every call: tests can ship together without polluting
     each other's namespace. Returns the loaded module.
 
     The module is registered in ``sys.modules`` under both a unique key (for
     isolation) and ``"solution"`` (so ``from solution import *`` style setup
-    blocks in benchmark specs resolve correctly).
+    blocks in benchmark specs resolve correctly) — this keeps backward
+    compatibility for existing YAML benchmarks regardless of the actual
+    source filename.
+
+    v0.12.0: ``file_name`` allows non-default code task entry points (e.g.
+    ``smart_sort.py``) declared in the rubric axis spec via ``spec["file"]``.
     """
-    sol = task_dir.workspace_path() / "solution.py"
+    # Defense: share the same filename policy as the implement-side extractor
+    # (workers._is_safe_workspace_filename) so a name accepted at write time is
+    # also accepted at read time, and vice versa.
+    from agent_loop.workers import _is_safe_workspace_filename
+    if not _is_safe_workspace_filename(file_name):
+        raise ValueError(f"unsafe spec.file: {file_name!r}")
+    sol = task_dir.workspace_path() / file_name
     if not sol.exists():
-        raise FileNotFoundError("workspace/solution.py does not exist")
+        raise FileNotFoundError(f"workspace/{file_name} does not exist")
     name = f"_agent_loop_solution_{int(time.time() * 1e6)}"
     spec = importlib.util.spec_from_file_location(name, sol)
     if spec is None or spec.loader is None:
         raise ImportError(f"could not build module spec for {sol}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    sys.modules["solution"] = mod  # for benchmark setup `from solution import *`
+    sys.modules["solution"] = mod  # legacy alias; benchmarks import via this name
     spec.loader.exec_module(mod)
     return mod
 
@@ -90,8 +101,12 @@ def run_pytest(
     code = str(code)
     total = _count_asserts(code) or 1
 
+    # v0.12.0 — optional `file` key lets the rubric target a non-default
+    # entry point (e.g. ``manuscript_helper.py``). Defaults to ``solution.py``
+    # so every existing rubric continues to work unchanged.
+    src_file = str(spec.get("file") or "solution.py")
     try:
-        mod = _load_solution(task_dir)
+        mod = _load_solution(task_dir, src_file)
     except Exception as exc:
         return AxisScore(
             name=name,

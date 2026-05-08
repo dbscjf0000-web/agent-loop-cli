@@ -83,28 +83,87 @@ def _extract_python(text: str) -> tuple[str, str]:
 
 
 def _extract_test_subtask_files(text: str) -> dict[str, str]:
-    """TDD integration (Step B): find all subsequent ``python`` blocks whose
-    first non-blank line is ``# file: test_subtask*.py`` and return a
-    ``{filename: code}`` mapping.
+    """Backward-compat wrapper kept for existing call sites and tests.
 
-    Backward compat: blocks without the magic header are ignored, so existing
-    single-block implement outputs continue to work unchanged.
+    Returns only ``test_subtask*.py`` files from the generalized
+    ``_extract_workspace_files`` output.
     """
     import re as _re
+    all_files = _extract_workspace_files(text)
     out: dict[str, str] = {}
-    pattern = _re.compile(r"```python\s*\n(.*?)```", _re.DOTALL)
-    blocks = pattern.findall(text)
-    if len(blocks) <= 1:
-        return out  # only solution.py, nothing else
-    for raw in blocks[1:]:  # skip first (= solution.py)
-        body = raw.lstrip("\n")
-        first_line = body.split("\n", 1)[0].strip() if body else ""
-        m = _re.match(r"#\s*file:\s*(test_subtask[A-Za-z0-9_]*\.py)\s*$", first_line)
+    for fname, body in all_files.items():
+        if _re.match(r"^test_subtask[A-Za-z0-9_]*\.py$", fname):
+            out[fname] = body
+    return out
+
+
+import re as _vre  # v0.12.0 — module-level so we don't __import__ on every call.
+
+# Path traversal defense: filenames must match this strict pattern so that an
+# LLM cannot write outside workspace via headers like ``# file: ../etc/passwd``.
+_SAFE_FILENAME_RE = _vre.compile(r"^[A-Za-z0-9_\-.]+$")
+# Match any fenced code block: ```<lang> ... ``` (lang is optional).
+_GENERIC_FENCE_RE = _vre.compile(
+    r"```([A-Za-z0-9_\-+]*)\s*\n(.*?)```",
+    _vre.DOTALL,
+)
+# Match a `# file: <name>` header. Supports several comment styles.
+_FILE_HEADER_RE = _vre.compile(
+    r"^\s*(?:#|//|--|;|<!--|/\*)\s*file\s*:\s*([A-Za-z0-9_\-.]+)\s*(?:-->|\*/)?\s*$"
+)
+
+
+def _is_safe_workspace_filename(name: str) -> bool:
+    """Reject path traversal and absolute paths. Allowed: ``A-Z a-z 0-9 _ - .``."""
+    if not name or len(name) > 255:
+        return False
+    if name in (".", "..") or name.startswith("."):  # also block dotfiles like .bashrc
+        return False
+    if "/" in name or "\\" in name or ".." in name:
+        return False
+    return bool(_SAFE_FILENAME_RE.match(name))
+
+
+def _extract_workspace_files(text: str) -> dict[str, str]:
+    """v0.12.0 — extract all ``# file: <name>`` annotated fenced blocks from
+    an Implement worker response into a ``{filename: body}`` mapping.
+
+    Rules:
+      - Block format: ```<lang>\\n# file: <name>\\n<body>\\n```
+      - Header on the first non-blank line of the block; comment style varies
+        by language (#, //, --, ;, <!-- -->, /* */).
+      - Filenames are strictly validated (path traversal blocked).
+      - Header line itself is stripped from the saved body.
+      - Blocks without a recognized header are ignored here (the legacy
+        ``solution.py`` default for the first python block is handled by
+        ``run_implement`` for backward-compat).
+      - Last duplicate filename wins (LLM may emit revised version).
+
+    Pure parsing — no I/O, no path resolution. Caller is responsible for
+    saving the body under the workspace dir.
+    """
+    out: dict[str, str] = {}
+    for _lang, raw in _GENERIC_FENCE_RE.findall(text):
+        # Find the first non-blank line — Codex review fix: previous logic
+        # only stripped leading newlines, so a block starting with a
+        # whitespace-only line silently lost its header.
+        lines = raw.splitlines()
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            continue
+        first_line = lines[idx]
+        m = _FILE_HEADER_RE.match(first_line)
         if not m:
             continue
-        fname = m.group(1)
-        # Drop the header line; the rest is the test source.
-        rest = body.split("\n", 1)[1] if "\n" in body else ""
+        fname = m.group(1).strip()
+        if not _is_safe_workspace_filename(fname):
+            log.warning(
+                "implement: rejected unsafe filename in # file: header: %r", fname
+            )
+            continue
+        rest = "\n".join(lines[idx + 1 :])
         out[fname] = rest.rstrip() + "\n"
     return out
 
@@ -808,27 +867,46 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
         workspace=ws,
     )
 
-    code, prose = _extract_python(resp.text)
-    if code:
-        (ws / "solution.py").write_text(code, encoding="utf-8")
-    # TDD integration (Step B): save any sub-task test files declared via
-    # `# file: test_subtaskN.py` headers in additional code blocks.
-    test_files = _extract_test_subtask_files(resp.text)
-    for fname, fcode in test_files.items():
-        (ws / fname).write_text(fcode, encoding="utf-8")
-    # Step B (Codex review #4): soft-check warnings — never fail the run.
-    if code and ("def test_" in code or "# file:" in code):
+    # v0.12.0 — generalized output contract:
+    #   1. Any fenced block with `# file: <name>` header → saved verbatim.
+    #   2. If no headered solution.py block exists, the first ```python``` block
+    #      without a header is treated as the legacy solution.py (backward-compat
+    #      for older code tasks whose plans don't mention file names).
+    workspace_files = _extract_workspace_files(resp.text)
+    legacy_code = ""
+    legacy_prose = ""
+    if "solution.py" not in workspace_files:
+        legacy_code, legacy_prose = _extract_python(resp.text)
+        if legacy_code:
+            workspace_files["solution.py"] = legacy_code
+
+    for fname, body in workspace_files.items():
+        (ws / fname).write_text(body, encoding="utf-8")
+
+    # Soft-check warnings (never fail the run).
+    sol_code = workspace_files.get("solution.py", "")
+    if sol_code and ("def test_" in sol_code and "import pytest" in sol_code):
         log.warning(
-            "implement: first code block looks test-like — "
-            "did you mean to put solution.py first?"
+            "implement: solution.py looks test-like — did you swap solution and test?"
         )
     plan_subtasks = _count_plan_subtasks(plan)
-    if plan_subtasks > 0 and len(test_files) < plan_subtasks:
+    test_files_count = sum(
+        1 for n in workspace_files if n.startswith("test_subtask")
+    )
+    if plan_subtasks > 0 and test_files_count < plan_subtasks:
         log.warning(
             "implement: plan.md declares %d sub-tasks but only %d "
             "test_subtask*.py files were extracted",
-            plan_subtasks, len(test_files),
+            plan_subtasks, test_files_count,
         )
+
+    # Prose = anything outside fenced blocks. We compute it after extraction
+    # by re-using legacy_prose when we fell back, otherwise stripping all
+    # fenced blocks from resp.text.
+    if legacy_prose:
+        prose = legacy_prose
+    else:
+        prose = _GENERIC_FENCE_RE.sub("", resp.text).strip()
     task_dir.write_artifact("execution_log.md", prose or resp.text)
     ContextEngine(task_dir).append_history(
         {
@@ -836,7 +914,7 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
             "phase": "implement",
             "summary": _summarize(prose or resp.text),
             "model": resp.model,
-            "wrote_solution_py": bool(code),
+            "wrote_solution_py": "solution.py" in workspace_files,
         }
     )
     return resp

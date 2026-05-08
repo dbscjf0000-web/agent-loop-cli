@@ -7,6 +7,25 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.12.0** — **Generalized output contract** (non-code tasks unblocked).
+The Implement worker no longer forces every task to produce
+`workspace/solution.py` — output files are now declared per-task by
+Plan and emitted by Implement via `# file: <name>` headers on each
+fenced code block. Closes the loophole that made manuscript-polish,
+spec-generation, and other text-output tasks silently fail (LLM would
+wrap real artifacts as functions inside `solution.py` and the rubric
+verifier never saw the actual output). Generalization spans 3 files:
+`prompts/implement.md` switches the contract to "follow plan's
+**산출물** section"; `workers._extract_workspace_files` parses any
+language fence with comment-style headers (`#`, `//`, `<!--`, `;`,
+`/* */`) and strict path-traversal validation; `pytest_runner` now
+accepts an optional `spec["file"]` (default `solution.py`) so rubrics
+can target non-default code entry points. Backward compat in three
+layers: headerless first `python` block still saves to `solution.py`,
+`spec["file"]` absent still loads `solution.py`, and the same filename
+policy is shared between writer and reader. 281 tests pass (21 new
+v0.12 tests + 260 prior).
+
 **v0.11.0** — **GIGO defense** (R spec audit + J rubric suspicion).
 Closes the loophole that let wrong task/rubric assumptions pass through
 all 5 phases (e.g. NMI manuscript case where a wrongly-asserted
