@@ -112,3 +112,51 @@ P의 sub-task 중 `verifier: pytest` 인 것만 추가 block 으로 작성:
 - Plan에 명시된 이름과 정확히 일치해야 함.
 - 디렉토리 traversal (`../`, 절대경로) 금지 — 자동 거부됨.
 - 코드 블록 안에 마크다운/주석 외 텍스트 섞지 마세요.
+
+### ⚠️ Nested fence 주의 — markdown 산출물 작성 시
+
+`# file: README.md` 같은 markdown 파일 안에 **코드 예시**를 넣어야 한다면,
+**외부** fence는 4-backtick (` ```` `) 또는 tilde (`~~~`)를 사용하세요.
+3-backtick(```)을 외부+내부 모두 쓰면 첫 번째 내부 ` ``` ` 가 외부를
+조기 종료시켜 파일이 잘립니다.
+
+❌ 잘못된 예 (README가 ## Install 에서 잘림):
+````
+```markdown
+# file: README.md
+## Install
+```bash
+pip install foo
+```
+## License
+MIT
+```
+````
+
+✅ 올바른 예 1 — 외부 4-backtick:
+`````
+````markdown
+# file: README.md
+## Install
+```bash
+pip install foo
+```
+## License
+MIT
+````
+`````
+
+✅ 올바른 예 2 — 외부 tilde:
+````
+~~~markdown
+# file: README.md
+## Install
+```bash
+pip install foo
+```
+## License
+MIT
+~~~
+````
+
+extractor는 ` ``` ` / ` ```` ` / `~~~` 모두 인식합니다.

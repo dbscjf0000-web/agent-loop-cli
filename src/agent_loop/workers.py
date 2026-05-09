@@ -102,9 +102,15 @@ import re as _vre  # v0.12.0 — module-level so we don't __import__ on every ca
 # Path traversal defense: filenames must match this strict pattern so that an
 # LLM cannot write outside workspace via headers like ``# file: ../etc/passwd``.
 _SAFE_FILENAME_RE = _vre.compile(r"^[A-Za-z0-9_\-.]+$")
-# Match any fenced code block: ```<lang> ... ``` (lang is optional).
+# Match any fenced code block. Three flavors of outer fence supported so the
+# LLM can use 4-backtick or tilde wrappers when its file content contains an
+# inner ``` (e.g. a README.md showing a `pip install` example):
+#   • 3-backtick (default, legacy)
+#   • 4-backtick (recommended for markdown files)
+#   • 3-tilde     (also recommended)
+# Open and close must use the same delimiter (regex backreference).
 _GENERIC_FENCE_RE = _vre.compile(
-    r"```([A-Za-z0-9_\-+]*)\s*\n(.*?)```",
+    r"(?P<fence>````|```|~~~)([A-Za-z0-9_\-+]*)\s*\n(.*?)(?P=fence)",
     _vre.DOTALL,
 )
 # Match a `# file: <name>` header. The name is captured permissively (slashes
@@ -145,7 +151,8 @@ def _extract_workspace_files(text: str) -> dict[str, str]:
     saving the body under the workspace dir.
     """
     out: dict[str, str] = {}
-    for _lang, raw in _GENERIC_FENCE_RE.findall(text):
+    # findall returns (fence, lang, body) per match; we only need lang+body.
+    for _fence, _lang, raw in _GENERIC_FENCE_RE.findall(text):
         # Find the first non-blank line — Codex review fix: previous logic
         # only stripped leading newlines, so a block starting with a
         # whitespace-only line silently lost its header.
@@ -862,12 +869,29 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     )
     ws = task_dir.workspace_path()
     ws.mkdir(parents=True, exist_ok=True)
-    # Codex review fix #5: clear stale test_subtask*.py from previous cycle
-    # so a deleted/renamed sub-task does not silently linger and get
-    # promoted to the regression bank.
-    for stale in ws.glob("test_subtask*.py"):
+    # Codex review fix #5 + v0.12.0 follow-up: at the start of each I phase,
+    # remove every artifact from the previous cycle EXCEPT files the
+    # orchestrator owns for rollback. Without this, a multi-file task whose
+    # current cycle drops one of last cycle's outputs (e.g. plan changed
+    # from "task.md + rubric.json" to "task.md only") would silently leak
+    # the stale file into the regression bank and confuse the verifier.
+    #
+    # Preserved set: best_solution.py (rollback target) + best_solution.*
+    # (any extension; multi-file tasks may produce multiple bests in the
+    # future) + __pycache__/. Everything else is deleted.
+    _PRESERVE_PREFIXES = ("best_solution",)
+    _PRESERVE_DIRS = {"__pycache__"}
+    for entry in ws.iterdir():
         try:
-            stale.unlink()
+            if entry.is_dir():
+                if entry.name in _PRESERVE_DIRS:
+                    continue
+                # No recursive cleanup here — keep nested dirs as-is to avoid
+                # surprising users; only top-level workspace files cycle.
+                continue
+            if any(entry.name.startswith(p) for p in _PRESERVE_PREFIXES):
+                continue
+            entry.unlink()
         except OSError:
             pass
     resp = call_model(
