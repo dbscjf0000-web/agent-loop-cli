@@ -883,6 +883,14 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     _PRESERVE_DIRS = {"__pycache__"}
     for entry in ws.iterdir():
         try:
+            # Codex review fix B: symlinks first — a symlink whose target is
+            # a directory passes is_dir() and would otherwise escape the
+            # cleanup, leaking sandbox state across cycles or even pointing
+            # outside the workspace. Always unlink the symlink itself
+            # (never follow), no exceptions.
+            if entry.is_symlink():
+                entry.unlink()
+                continue
             if entry.is_dir():
                 if entry.name in _PRESERVE_DIRS:
                     continue
@@ -892,8 +900,14 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
             if any(entry.name.startswith(p) for p in _PRESERVE_PREFIXES):
                 continue
             entry.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            # Codex review fix A: surface unlink failures so a permissions
+            # issue or transient FS error doesn't silently leave stale
+            # files that pollute the next cycle's workspace.
+            log.warning(
+                "implement: workspace cleanup could not remove %s (%s)",
+                entry.name, exc,
+            )
     resp = call_model(
         "implement",
         prompt,

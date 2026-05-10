@@ -99,6 +99,90 @@ def test_three_backtick_breaks_on_inner_three_backtick_legacy() -> None:
 # ---------------------------------------------------------------------------
 # workspace stale cleanup
 # ---------------------------------------------------------------------------
+def test_workspace_cleanup_unlinks_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review fix B: a symlink-to-dir would pass is_dir() and slip
+    through the cleanup, persisting sandbox state. Cleanup must remove
+    the symlink itself (without following it)."""
+    monkeypatch.chdir(tmp_path)
+    from agent_loop.config import Config
+    from agent_loop.state import TaskDir, new_task_id
+
+    td = TaskDir(root=tmp_path / ".agent_loop", task_id=new_task_id())
+    td.init()
+    ws = td.workspace_path()
+
+    # External target the symlink points at; must NOT be deleted.
+    target_dir = tmp_path / "host_data"
+    target_dir.mkdir()
+    (target_dir / "secret.txt").write_text("must survive", encoding="utf-8")
+
+    # Symlink inside workspace pointing at the host dir.
+    (ws / "leaked").symlink_to(target_dir)
+
+    # Stub call_model.
+    class _R:
+        text = "```python\n# file: solution.py\ndef f(): pass\n```\n"
+        prompt_tokens = 0; completion_tokens = 0; cost_usd = 0.0
+        latency_s = 0.0; model = "(fake)"
+    monkeypatch.setattr(
+        "agent_loop.workers.call_model",
+        lambda *a, **kw: _R(),
+    )
+
+    from agent_loop.workers import run_implement
+    td.task_md_path().write_text("dummy", encoding="utf-8")
+    td.write_artifact("plan.md", "# Plan\n## 1. 산출물\n- workspace/solution.py\n")
+
+    run_implement(td, Config())
+
+    # Symlink itself is gone; the host target survives untouched.
+    assert not (ws / "leaked").exists()
+    assert (target_dir / "secret.txt").read_text(encoding="utf-8") == "must survive"
+
+
+def test_workspace_cleanup_logs_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """Codex review fix A: an unlink failure must surface as a warning
+    instead of silently leaving stale files."""
+    monkeypatch.chdir(tmp_path)
+    import logging
+    from agent_loop.config import Config
+    from agent_loop.state import TaskDir, new_task_id
+
+    td = TaskDir(root=tmp_path / ".agent_loop", task_id=new_task_id())
+    td.init()
+    ws = td.workspace_path()
+
+    (ws / "stuck.txt").write_text("x", encoding="utf-8")
+
+    # Force unlink to fail by monkeypatching Path.unlink for entries in ws.
+    real_unlink = Path.unlink
+    def _flaky_unlink(self, *a, **kw):
+        if "stuck.txt" in str(self):
+            raise OSError("simulated EACCES")
+        return real_unlink(self, *a, **kw)
+    monkeypatch.setattr(Path, "unlink", _flaky_unlink)
+
+    class _R:
+        text = "```python\n# file: solution.py\ndef f(): pass\n```\n"
+        prompt_tokens = 0; completion_tokens = 0; cost_usd = 0.0
+        latency_s = 0.0; model = "(fake)"
+    monkeypatch.setattr("agent_loop.workers.call_model", lambda *a, **kw: _R())
+
+    from agent_loop.workers import run_implement
+    td.task_md_path().write_text("dummy", encoding="utf-8")
+    td.write_artifact("plan.md", "# Plan\n## 1. 산출물\n- workspace/solution.py\n")
+
+    with caplog.at_level(logging.WARNING, logger="agent_loop.workers"):
+        run_implement(td, Config())
+
+    # The warning must mention the file we couldn't unlink.
+    assert any("stuck.txt" in r.getMessage() for r in caplog.records)
+
+
 def test_run_implement_clears_old_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stale files from a previous I phase must be cleaned, except
     best_solution.* which the orchestrator owns for rollback."""
