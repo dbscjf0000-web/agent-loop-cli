@@ -7,6 +7,26 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.13.0** — **Staged Implement** (multi-worker patch pipeline). Lifts
+the structural ~8k-output cap that limited the Implement phase to a
+single LLM call. When a plan uses `### stage N` headers under
+`## 3. Sub-tasks`, each stage runs its sub-tasks in parallel (one
+LLM call per sub-task) and every worker emits Aider-style
+`` ```search-replace `` blocks instead of whole files. A coordinator
+parses the patches, applies them sequentially within the stage, and
+moves on. Plans without stage headers keep the previous single-call
+path — full backward compatibility. Per-sub-task `model:` fields let
+a plan route different sub-tasks to different models. New
+`patch_engine.py` shares the writer-side filename policy with the
+extractor, treats empty SEARCH as append/create, and fails ambiguous
+multi-hit matches loudly. Workers see a workspace snapshot of the
+previous stage so patch anchors are written against the actual file
+state (not the plan's example) — the single fix that took the
+`manuscript_polish_staged` smoke from 0.575 to 0.925. Live verified
+on `claude/haiku-4-5` for two benches (1.000 on `v013_staged_demo`,
+0.925 on `manuscript_polish_staged` with 4 parallel sub-tasks in
+stage 2). 321 tests pass (16 new).
+
 **v0.12.0** — **Generalized output contract** (non-code tasks unblocked).
 The Implement worker no longer forces every task to produce
 `workspace/solution.py` — output files are now declared per-task by
