@@ -86,6 +86,18 @@ class StrategySpec(BaseModel):
         return float(v)
 
 
+class ResearcherSpec(BaseModel):
+    """v0.14 multi-searcher Research entry. Each searcher runs in parallel
+    against the same task and emits its own ``findings_<id>.md`` artifact;
+    a consolidator (the runtime.models.research model by default) merges
+    them into the canonical ``findings.md`` consumed by Plan."""
+
+    provider: str
+    # Optional one-line focus hint shown to the searcher prompt, e.g.
+    # "external standards", "performance", "alternative algorithms".
+    focus: str | None = None
+
+
 class Runtime(BaseModel):
     sandbox: bool = True
     max_cycles: int = 10
@@ -94,6 +106,10 @@ class Runtime(BaseModel):
     judges: list[JudgeSpec] | None = None
     # v0.3 multi-strategy plan fan-out. None / empty list -> single-plan mode.
     strategies: list[StrategySpec] | None = None
+    # v0.14 multi-searcher Research fan-out. None / empty list -> single-call R.
+    # When set, N searchers run in parallel and a consolidator (the
+    # runtime.models.research model) merges their findings into findings.md.
+    researchers: list[ResearcherSpec] | None = None
 
     # v0.3.1 — subprocess timeout (seconds) for CLI providers. ``cli_timeout``
     # is the default applied to every phase; a per-phase override (e.g.
@@ -176,6 +192,25 @@ class Runtime(BaseModel):
         for item in v:
             if isinstance(item, str):
                 out.append({"provider": item, "weight": 1.0})
+            else:
+                out.append(item)
+        return out
+
+    @field_validator("researchers", mode="before")
+    @classmethod
+    def _normalize_researchers(cls, v: Any) -> Any:
+        """Accept None / list[str] / list[dict] / list[ResearcherSpec] /
+        empty list (treated as None for single-call R)."""
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise TypeError("runtime.researchers must be a list")
+        if not v:
+            return None
+        out: list[Any] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append({"provider": item})
             else:
                 out.append(item)
         return out

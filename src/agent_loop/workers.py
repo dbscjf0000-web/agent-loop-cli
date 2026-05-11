@@ -601,18 +601,130 @@ def _build_prior_context_block(task_dir: TaskDir) -> str:
     return "\n".join(parts)
 
 
-def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
-    task = task_dir.task_md_path().read_text(encoding="utf-8")
-    memory = _memory_text(task_dir, config)
-    prompt = _load_prompt("research").format(task=task, memory=memory)
-    resp = call_model(
-        "research",
-        prompt,
+def _run_research_multi(
+    task_dir: TaskDir,
+    config: Config,
+    task: str,
+    memory: str,
+    researchers: list[Any],
+) -> ModelResponse:
+    """v0.14 — N searchers run in parallel, then a consolidator merges
+    their findings into the canonical ``findings.md``. Each searcher's
+    raw output is persisted as ``findings_<id>.md`` for audit.
+
+    Cost / tokens / latency are aggregated so the orchestrator's
+    per-run budget guard sees the true spend. The consolidator uses
+    ``config.models.research`` (the existing default).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    base_template = _load_prompt("research")
+
+    def _run_one(idx: int, spec: Any) -> tuple[int, Any, ModelResponse]:
+        focus = getattr(spec, "focus", None) or ""
+        sub_prompt = base_template.format(task=task, memory=memory)
+        if focus:
+            sub_prompt += (
+                f"\n\n---\n\n## ★ Searcher {idx + 1} focus\n"
+                f"이번 searcher 호출은 다음 측면에 집중하세요: **{focus}**\n"
+                "다른 searcher 가 다른 측면을 보고 있으니 중복을 줄이고 본인 focus 안에서 깊게."
+            )
+        # Per-searcher provider override.
+        cfg = config.model_copy(deep=True)
+        cfg.models.research = spec.provider
+        resp = call_model(
+            "research", sub_prompt, system=_SYSTEM_PROMPT,
+            config=cfg, workspace=task_dir.workspace_path(),
+        )
+        return idx, spec, resp
+
+    # Parallel searchers.
+    results: list[tuple[int, Any, ModelResponse]] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(researchers))) as pool:
+        futures = [pool.submit(_run_one, i, s) for i, s in enumerate(researchers)]
+        for f in as_completed(futures):
+            results.append(f.result())
+    results.sort(key=lambda t: t[0])
+
+    findings_blocks: list[str] = []
+    total_in = 0
+    total_out = 0
+    total_cost = 0.0
+    max_latency = 0.0
+    for idx, spec, resp in results:
+        fname = f"findings_{idx + 1}.md"
+        task_dir.write_artifact(fname, resp.text)
+        focus = getattr(spec, "focus", None) or "(no focus)"
+        findings_blocks.append(
+            f"===== searcher {idx + 1} ({spec.provider}, focus={focus}) =====\n{resp.text}"
+        )
+        total_in += resp.prompt_tokens
+        total_out += resp.completion_tokens
+        total_cost += resp.cost_usd
+        max_latency = max(max_latency, resp.latency_s)
+        task_dir.append_decision(
+            "research_searcher",
+            idx=idx + 1, provider=spec.provider, focus=focus,
+            tokens_out=resp.completion_tokens,
+        )
+
+    # Consolidator merges N findings into one canonical findings.md.
+    consolidator_prompt = (
+        "당신은 R 단계의 **consolidator**입니다. 아래 N 명의 searcher 가 "
+        "각자의 시각으로 만든 findings 를 받아 하나의 통합 `findings.md`로 합칩니다.\n\n"
+        "## 통합 원칙\n"
+        "- 중복 제거: 같은 사실이 여러 searcher에 있으면 1번만.\n"
+        "- 상충 해소: 두 searcher 가 다른 주장을 하면 둘 다 명시하고 어느 쪽이 더 신뢰할 만한지 근거와 함께 판단.\n"
+        "- 누락 없음: 한 searcher에만 등장하는 fact 도 통합본에 포함.\n"
+        "- 출력은 `research.md` 의 표준 섹션 구조 (## 1. 요구사항 분해 … ## 7. ★ Spec Audit).\n\n"
+        f"## Task\n{task}\n\n"
+        f"## Memory\n{memory}\n\n"
+        "## 각 searcher 의 raw findings\n\n"
+        + "\n\n".join(findings_blocks)
+    )
+    cons_resp = call_model(
+        "research", consolidator_prompt,
         system=_SYSTEM_PROMPT,
         config=config,
         workspace=task_dir.workspace_path(),
     )
-    task_dir.write_artifact("findings.md", resp.text)
+    task_dir.write_artifact("findings.md", cons_resp.text)
+    total_in += cons_resp.prompt_tokens
+    total_out += cons_resp.completion_tokens
+    total_cost += cons_resp.cost_usd
+    max_latency += cons_resp.latency_s  # consolidator is serial after searchers
+    task_dir.append_decision(
+        "research_consolidator",
+        searchers=len(researchers), tokens_out=cons_resp.completion_tokens,
+    )
+
+    return ModelResponse(
+        text=cons_resp.text,
+        prompt_tokens=total_in,
+        completion_tokens=total_out,
+        cost_usd=round(total_cost, 6),
+        latency_s=round(max_latency, 4),
+        model=f"(researchers x{len(researchers)} + consolidator: {cons_resp.model})",
+    )
+
+
+def run_research(task_dir: TaskDir, config: Config) -> ModelResponse:
+    task = task_dir.task_md_path().read_text(encoding="utf-8")
+    memory = _memory_text(task_dir, config)
+    # v0.14 — multi-searcher Research path when runtime.researchers is set.
+    researchers = getattr(config.runtime, "researchers", None)
+    if researchers:
+        resp = _run_research_multi(task_dir, config, task, memory, researchers)
+    else:
+        prompt = _load_prompt("research").format(task=task, memory=memory)
+        resp = call_model(
+            "research",
+            prompt,
+            system=_SYSTEM_PROMPT,
+            config=config,
+            workspace=task_dir.workspace_path(),
+        )
+        task_dir.write_artifact("findings.md", resp.text)
     ContextEngine(task_dir).append_history(
         {
             "cycle": _current_cycle(task_dir),
