@@ -7,6 +7,23 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.14.0** — **Multi-searcher Research** (searcher / consolidator
+pattern). The Research phase now mirrors what v0.3 did for Plan/Judge
+and v0.13 did for Implement: when ``runtime.researchers`` is set in
+the TOML config, N searchers run in parallel against the same task —
+each with an optional ``focus`` hint so the calls actually
+specialise — and a consolidator (the existing
+``runtime.models.research`` model) merges their per-searcher
+``findings_N.md`` artifacts into the canonical ``findings.md`` that
+Plan consumes. Searchers are normalised the same way as judges and
+strategies (``[]`` becomes "single-call"). Cost / tokens / latency
+are aggregated end-to-end so the per-run budget guard still sees
+true spend, and every searcher / consolidator call is recorded in
+``decision.log``. Live verified on ``cursor/composer-2`` across all
+five phases (``v013_staged_demo``, 2 searchers + consolidator + 2
+staged Implement sub-tasks, ``weighted_score 1.000`` in one cycle).
+326 tests pass (5 new).
+
 **v0.13.0** — **Staged Implement** (multi-worker patch pipeline). Lifts
 the structural ~8k-output cap that limited the Implement phase to a
 single LLM call. When a plan uses `### stage N` headers under
