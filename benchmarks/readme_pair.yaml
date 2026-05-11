@@ -1,0 +1,63 @@
+name: readme-pair
+category: documentation
+description: |
+  Multi-output non-code task: produce README.md + tagline.txt as two
+  separate artifacts and exercise the v0.12.0 multi-file `file:` list
+  evaluator. Exercises:
+    - I phase generalized output (2 artifacts via `# file:` headers)
+    - rule evaluator with workspace-relative file paths
+    - llm_rubric with multi-file list (the 9a6da79 fix)
+
+task: |
+  당신은 작은 오픈소스 도구 `tinywiki` 의 README와 한줄 태그라인을 작성합니다.
+
+  ## 산출물 (정확히 2개 파일)
+  - `workspace/README.md`
+  - `workspace/tagline.txt`
+
+  ## tinywiki 정보 (사실)
+  - LLM이 마크다운 위키를 점진적으로 컴파일해주는 CLI 도구
+  - Karpathy의 LLM Wiki 패턴 구현 (Apr 2026)
+  - 단일 파일 Python, 의존성: `pyyaml` 만
+  - 라이선스: MIT
+
+  ## README.md 요건
+  - `# tinywiki` 헤더 1줄
+  - `## What it does` 섹션 (≥3문장)
+  - `## Install` 섹션 (`pip install tinywiki` 한줄 코드 블록 포함)
+  - `## License` 섹션 (MIT 명시)
+  - 본문 어디엔가 `LLM Wiki` 키워드 등장
+  - 200~500 단어
+
+  ## tagline.txt 요건
+  - 정확히 1줄, 줄바꿈 없이
+  - 5~12 단어 영문
+  - 마침표 없음
+
+success_criteria:
+  - axis: readme_structure
+    weight: 0.3
+    rule: "`## What it does`_count>=1; `## Install`_count>=1; `## License`_count>=1; `LLM Wiki` in; `MIT` in"
+    file: README.md
+  - axis: install_block
+    weight: 0.15
+    rule: "`pip install tinywiki` in"
+    file: README.md
+  - axis: tagline_length
+    weight: 0.15
+    rule: "`.`_count==0"
+    file: tagline.txt
+  - axis: cross_consistency
+    weight: 0.4
+    file:
+      - README.md
+      - tagline.txt
+    criterion: |
+      README.md 와 tagline.txt 가 (1) 같은 도구를 설명하고 있고 (2) tagline 이
+      README의 핵심을 압축한 형태인지 0.0~1.0 점수.
+      불일치(서로 다른 도구를 설명하거나, tagline 이 README와 무관)면 ≤0.3.
+
+budget:
+  max_cycles: 2
+  max_redo: 1
+  max_usd: 0.3

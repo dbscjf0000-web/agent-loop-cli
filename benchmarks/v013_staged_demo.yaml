@@ -1,0 +1,51 @@
+name: v013-staged-demo
+category: documentation
+description: |
+  Smoke test for v0.13 stage + patch pipeline. Two sub-tasks must run
+  in different stages because the second depends on the first's output.
+  Cheap to run (single small markdown file, haiku-class models).
+
+task: |
+  당신은 `notes.md` 라는 간단한 노트 파일을 다듬어야 합니다.
+
+  ## 산출물
+  - `workspace/notes.md` (단 1개 파일)
+
+  ## 요구 형식 (최종 산출물)
+  - 1단계 헤더 `# notes` 1줄
+  - `## Status` 섹션 (한 줄)
+  - `## TODO` 섹션 (불릿 ≥ 2개)
+  - 본문 어디엔가 키워드 `v0.13` 등장
+
+  ## Sub-tasks (P 가 이 구조 그대로 plan.md 에 옮기세요)
+
+  ### stage 1 (병렬)
+  - subtask-1: 초기 notes.md 생성
+    - goal: `# notes` 헤더 + `## Status` + `## TODO` 골격 markdown 생성 (≤ 80 단어).
+    - acceptance: notes.md 존재 + 3개 헤더 포함.
+    - verifier: rule
+    - check_hint: section="Status" in notes.md
+    - depends_on:
+
+  ### stage 2 (앞 stage 완료 후)
+  - subtask-2: TODO 항목 보강
+    - goal: stage 1 결과의 `## TODO` 섹션에 `v0.13` 키워드 포함 불릿 ≥ 1개를 SEARCH/REPLACE patch 로 추가.
+    - acceptance: 본문에 `v0.13` + `## TODO` 아래 불릿 ≥ 2.
+    - verifier: rule
+    - check_hint: text="v0.13" in notes.md
+    - depends_on: subtask-1
+
+success_criteria:
+  - axis: structure
+    weight: 0.6
+    rule: "`# notes`_count>=1; `## Status`_count>=1; `## TODO`_count>=1"
+    file: notes.md
+  - axis: keyword
+    weight: 0.4
+    rule: "`v0.13` in"
+    file: notes.md
+
+budget:
+  max_cycles: 1
+  max_redo: 0
+  max_usd: 0.1

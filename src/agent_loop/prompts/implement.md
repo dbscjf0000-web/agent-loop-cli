@@ -113,6 +113,63 @@ P의 sub-task 중 `verifier: pytest` 인 것만 추가 block 으로 작성:
 - 디렉토리 traversal (`../`, 절대경로) 금지 — 자동 거부됨.
 - 코드 블록 안에 마크다운/주석 외 텍스트 섞지 마세요.
 
+---
+
+## v0.13 Patch 모드 (stage 그룹 사용 시)
+
+Plan 에 `### stage N` 헤더로 sub-task가 묶여 있고 이번 호출이 그 안의
+**한 sub-task만 처리**하라는 지시를 받았다면, **전체 파일을 다시 쓰지
+말고 SEARCH/REPLACE patch 블록만 출력**하세요. coordinator가 받아서
+같은 stage 의 다른 worker patch 들과 합쳐서 한 번에 적용합니다.
+
+### Patch 출력 형식 (엄격)
+
+```
+```search-replace
+file: <basename>
+<<<<<<< SEARCH
+<교체 대상 — 파일의 정확한 부분 문자열>
+=======
+<교체 후 내용>
+>>>>>>> REPLACE
+```
+```
+
+규칙:
+- `file:` = workspace-relative basename (예: `solution.py`, `manuscript.md`).
+- SEARCH 블록의 텍스트는 **파일에 정확히 1번만** 등장해야 합니다.
+  여러 번 매치되면 patch 가 실패합니다 — 더 좁은 SEARCH 블록을 쓰세요.
+- 같은 응답에 여러 patch 블록 가능. 적용은 출력 순서대로.
+- SEARCH 가 빈 문자열이면 "파일 끝에 append" 또는 "파일 생성"으로 해석.
+- 전체 파일 출력 (`# file:` 헤더) 과 섞지 마세요 — patch 모드면 patch 만.
+
+### 예 — 코드 task
+
+```search-replace
+file: solution.py
+<<<<<<< SEARCH
+def slow_sort(arr):
+    return sorted(arr)
+=======
+def fast_sort(arr):
+    import numpy as np
+    return np.sort(np.asarray(arr)).tolist()
+>>>>>>> REPLACE
+```
+
+### 예 — 문서 task
+
+```search-replace
+file: manuscript.md
+<<<<<<< SEARCH
+## Methods (a)
+Step 1 ...
+=======
+## Methods
+Step 1 ...
+>>>>>>> REPLACE
+```
+
 ### ⚠️ Nested fence 주의 — markdown 산출물 작성 시
 
 `# file: README.md` 같은 markdown 파일 안에 **코드 예시**를 넣어야 한다면,

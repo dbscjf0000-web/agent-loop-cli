@@ -18,6 +18,7 @@ import sys
 import time
 from importlib import resources
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent_loop.config import Config
@@ -64,7 +65,12 @@ def _count_plan_subtasks(plan_text: str) -> int:
     import re as _re
     if not plan_text:
         return 0
-    return len(_re.findall(r"^###\s+subtask-", plan_text, flags=_re.IGNORECASE | _re.MULTILINE))
+    # Accept bullet, level-3, or deeper heading styles (`####`).
+    return len(_re.findall(
+        r"^(?:[-*]\s+|#{3,}\s+)subtask-",
+        plan_text,
+        flags=_re.IGNORECASE | _re.MULTILINE,
+    ))
 
 
 def _extract_python(text: str) -> tuple[str, str]:
@@ -848,6 +854,220 @@ def _run_plan_multi(task_dir: TaskDir, config: Config) -> ModelResponse:
     )
 
 
+@dataclass
+class _StageSubtask:
+    """v0.13 — one row inside a ``### stage N`` group of plan.md."""
+    id: str
+    name: str
+    model: str | None = None
+    body: str = ""  # the raw bullet body so the worker can read goal/acceptance
+
+
+@dataclass
+class _Stage:
+    """v0.13 — group of subtasks that run in parallel within a stage."""
+    index: int
+    subtasks: list[_StageSubtask] = field(default_factory=list)
+
+
+_STAGE_HEAD_RE = _vre.compile(r"^###\s+stage\s+([0-9]+)\b.*$", _vre.IGNORECASE | _vre.MULTILINE)
+# Accept BOTH formats LLMs commonly produce:
+#   "- subtask-1: name"   (bullet list, v0.13 native)
+#   "### subtask-1: name" (level-3 header, inherited from v0.12 plan template)
+_SUBTASK_HEAD_RE = _vre.compile(
+    # Any of: bullet `- subtask-...`, header `### subtask-...`, `#### ...`, etc.
+    r"^(?:[-*]\s+|#{3,}\s+)(subtask-[A-Za-z0-9_-]+)\s*:\s*(.+?)\s*$",
+    _vre.MULTILINE,
+)
+
+
+def _extract_plan_stages(plan_text: str) -> list[_Stage]:
+    """Parse the optional ``### stage N`` grouping introduced in v0.13.
+
+    Returns an empty list when the plan does not use stage headers — that
+    is the legacy single-call path. When stages are present we slice the
+    plan body between consecutive stage headers and collect each
+    ``- subtask-X: name`` bullet plus an optional ``model:`` field below it.
+    """
+    heads = [(m.start(), int(m.group(1)), m.end()) for m in _STAGE_HEAD_RE.finditer(plan_text or "")]
+    if not heads:
+        return []
+    # Append sentinel for slicing.
+    stop_re = _vre.compile(r"^##\s+[^#]", _vre.MULTILINE)
+    end_of_section = len(plan_text)
+    next_section = stop_re.search(plan_text, heads[-1][2])
+    if next_section:
+        end_of_section = next_section.start()
+    spans: list[tuple[int, int, int]] = []  # (stage_idx, body_start, body_end)
+    for i, (_pos, idx, body_start) in enumerate(heads):
+        body_end = heads[i + 1][0] if i + 1 < len(heads) else end_of_section
+        spans.append((idx, body_start, body_end))
+    stages: list[_Stage] = []
+    for idx, b0, b1 in spans:
+        body = plan_text[b0:b1]
+        stage = _Stage(index=idx)
+        # Find each subtask bullet inside this stage body.
+        sub_matches = list(_SUBTASK_HEAD_RE.finditer(body))
+        for j, m in enumerate(sub_matches):
+            sid = m.group(1)
+            name = m.group(2).strip()
+            sub_end = sub_matches[j + 1].start() if j + 1 < len(sub_matches) else len(body)
+            sub_body = body[m.end():sub_end]
+            mm = _vre.search(r"^\s*-\s*model\s*:\s*(\S+)\s*$", sub_body, _vre.MULTILINE)
+            stage.subtasks.append(
+                _StageSubtask(
+                    id=sid,
+                    name=name,
+                    model=mm.group(1) if mm else None,
+                    body=sub_body.strip(),
+                )
+            )
+        if stage.subtasks:
+            stages.append(stage)
+    return stages
+
+
+def _run_implement_staged(
+    task_dir: TaskDir,
+    config: Config,
+    stages: list[_Stage],
+    *,
+    task: str,
+    plan: str,
+    best_summary: str,
+    ws: Path,
+) -> ModelResponse:
+    """v0.13 — execute the Implement phase as a sequence of parallel stages,
+    each subtask producing SEARCH/REPLACE patches that the coordinator
+    applies before moving to the next stage."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from agent_loop.patch_engine import apply_patches, parse_patches
+
+    base_prompt_template = _load_prompt("implement")
+    total_tokens_in = 0
+    total_tokens_out = 0
+    total_cost = 0.0
+    total_latency = 0.0
+    stage_summaries: list[dict[str, Any]] = []
+    applied_total = 0
+    failed_total = 0
+
+    for stage in stages:
+        # One model call per subtask, parallelised within the stage.
+        # Snapshot workspace at the start of this stage so every parallel
+        # worker sees the same (stage N-1 final) file state — critical for
+        # patch anchor stability. Without this, workers would guess anchors
+        # from the plan's example text, which often does not match what
+        # earlier stages actually produced.
+        workspace_snapshot: list[str] = []
+        for p in sorted(ws.iterdir()):
+            if not p.is_file():
+                continue
+            if p.name.startswith("best_solution"):
+                continue
+            try:
+                body = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # Cap each file at 8 KB to keep prompt size sane; patch anchors
+            # are typically near the start or section headers anyway.
+            if len(body) > 8000:
+                body = body[:8000] + f"\n... [truncated {len(body) - 8000} chars]"
+            workspace_snapshot.append(f"===== {p.name} =====\n{body}")
+        workspace_block = "\n\n".join(workspace_snapshot) if workspace_snapshot else "(workspace empty)"
+
+        def _run_subtask(st: _StageSubtask) -> tuple[_StageSubtask, ModelResponse]:
+            sub_prompt = base_prompt_template.format(
+                task=task, plan=plan, best_solution_summary=best_summary,
+            )
+            sub_prompt += (
+                f"\n\n---\n\n## ★ Stage {stage.index} / subtask {st.id} 지시\n"
+                f"이번 호출은 plan.md 의 `{st.id}: {st.name}` 만 처리합니다. "
+                "전체 산출물 출력 금지. 변경할 부분만 SEARCH/REPLACE patch 블록으로 출력하세요.\n\n"
+                "**중요**: SEARCH 블록의 텍스트는 아래 'Workspace 현재 상태'에 "
+                "정확히 1번만 등장하는 부분 문자열이어야 합니다. plan.md의 '예시'가 "
+                "아니라 아래 실제 파일 내용을 기준으로 anchor를 골라주세요.\n\n"
+                "## Workspace 현재 상태 (이전 stage 결과)\n"
+                f"{workspace_block}"
+            )
+            # Per-subtask model override if plan declared one.
+            cfg_for_sub = config
+            if st.model:
+                # Copy config with the implement model swapped.
+                cfg_for_sub = config.model_copy(deep=True)
+                cfg_for_sub.models.implement = st.model
+            r = call_model(
+                "implement", sub_prompt, system=_SYSTEM_PROMPT,
+                config=cfg_for_sub, workspace=ws,
+            )
+            return st, r
+
+        responses: list[tuple[_StageSubtask, ModelResponse]] = []
+        max_workers = max(1, len(stage.subtasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_run_subtask, st) for st in stage.subtasks]
+            for fut in as_completed(futures):
+                responses.append(fut.result())
+
+        # Apply patches sequentially within the stage so a later patch can
+        # operate on text the previous one produced.
+        stage_applied = 0
+        stage_failed = 0
+        stage_failures: list[str] = []
+        # Order by subtask id for stable behaviour even though calls were parallel.
+        responses.sort(key=lambda pair: pair[0].id)
+        for st, resp in responses:
+            total_tokens_in += resp.prompt_tokens
+            total_tokens_out += resp.completion_tokens
+            total_cost += resp.cost_usd
+            total_latency = max(total_latency, resp.latency_s)
+            patches = parse_patches(resp.text)
+            res = apply_patches(ws, patches)
+            stage_applied += len(res.applied)
+            stage_failed += len(res.failed)
+            for p, reason in res.failed:
+                stage_failures.append(f"{st.id}/{p.file}: {reason}")
+            task_dir.append_decision(
+                "implement_subtask",
+                stage=stage.index, subtask=st.id, model=st.model or "default",
+                patches=len(patches), applied=len(res.applied), failed=len(res.failed),
+            )
+        stage_summaries.append({
+            "stage": stage.index,
+            "subtasks": [st.id for st in stage.subtasks],
+            "applied": stage_applied,
+            "failed": stage_failed,
+            "failures": stage_failures,
+        })
+        applied_total += stage_applied
+        failed_total += stage_failed
+
+    # Persist a stage summary for downstream Judge audit + debugging.
+    task_dir.write_artifact("implement_stages.json", {"stages": stage_summaries})
+
+    summary_text = (
+        f"v0.13 staged implement: {len(stages)} stages, "
+        f"{applied_total} patches applied, {failed_total} failed."
+    )
+    task_dir.write_artifact("execution_log.md", summary_text)
+    ContextEngine(task_dir).append_history({
+        "cycle": _current_cycle(task_dir),
+        "phase": "implement",
+        "summary": summary_text,
+        "model": "(staged: multi)",
+        "applied_patches": applied_total,
+        "failed_patches": failed_total,
+    })
+    return ModelResponse(
+        text=summary_text,
+        prompt_tokens=total_tokens_in,
+        completion_tokens=total_tokens_out,
+        cost_usd=round(total_cost, 6),
+        latency_s=round(total_latency, 4),
+        model="(staged)",
+    )
+
+
 def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     task = task_dir.task_md_path().read_text(encoding="utf-8")
     plan = _read_or(task_dir, "plan.md", "(no plan)")
@@ -864,11 +1084,23 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
                 indent=2,
                 ensure_ascii=False,
             )
+    ws = task_dir.workspace_path()
+    ws.mkdir(parents=True, exist_ok=True)
+    # v0.13 — if plan uses ### stage N grouping, switch to the staged
+    # patch-based path before touching the single-call prompt.
+    stages = _extract_plan_stages(plan)
+    if stages:
+        # Stage path does not clean the workspace on entry — patches apply
+        # to whatever the previous stage produced. Best-solution rollback
+        # files are left in place exactly as in the single-call path.
+        return _run_implement_staged(
+            task_dir, config, stages,
+            task=task, plan=plan, best_summary=best_summary, ws=ws,
+        )
+
     prompt = _load_prompt("implement").format(
         task=task, plan=plan, best_solution_summary=best_summary
     )
-    ws = task_dir.workspace_path()
-    ws.mkdir(parents=True, exist_ok=True)
     # Codex review fix #5 + v0.12.0 follow-up: at the start of each I phase,
     # remove every artifact from the previous cycle EXCEPT files the
     # orchestrator owns for rollback. Without this, a multi-file task whose
