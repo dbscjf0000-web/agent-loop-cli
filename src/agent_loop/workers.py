@@ -50,6 +50,34 @@ def _load_prompt(name: str) -> str:
 
 _FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+# v0.16 — accept 4-backtick fences too (LLMs sometimes nest fences for safety).
+_JSON_FENCE_4_RE = re.compile(r"````(?:json)?\s*\n(.*?)````", re.DOTALL)
+
+
+def _json_lenient_loads(raw: str) -> dict[str, Any]:
+    """v0.16 — last-resort JSON parser for LLM output. Tries common
+    relaxations that Python's strict json.loads rejects:
+      • trailing commas before } or ]      (sonnet writes these often)
+      • smart quotes (“ ”) → ASCII double quote
+      • single quotes around keys/values   (best-effort)
+    Raises ``json.JSONDecodeError`` on final failure so the caller can
+    fall through to the brace-slice attempt.
+    """
+    s = raw
+    # smart-quote normalisation
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("‘", "'").replace("’", "'")
+    # trailing commas — strip ",   }" and ",   ]" with optional whitespace/newlines.
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    # As a safety net, try a single-quote → double-quote conversion only
+    # when the strict load on the corrected text still fails. Aiming at
+    # ``{'better': true}`` style output.
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    s2 = re.sub(r"(?<![A-Za-z0-9_])'([^'\n]*?)'(?!\w)", r'"\1"', s)
+    return json.loads(s2)
 
 
 import logging as _logging
@@ -212,19 +240,39 @@ def _extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # 2. Fenced block
-    m = _JSON_FENCE_RE.search(s)
-    if m:
-        block = m.group(1).strip()
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            pass
+    # 2. Fenced block — try both 4-backtick and 3-backtick variants.
+    # v0.16 fix: a strict parse may fail on sonnet output that includes
+    # trailing commas or smart quotes; fall through to the lenient pass
+    # so the judge action isn't lost to "stop" just because of formatting.
+    for fence_re in (_JSON_FENCE_4_RE, _JSON_FENCE_RE):
+        m = fence_re.search(s)
+        if m:
+            block = m.group(1).strip()
+            try:
+                return json.loads(block)
+            except json.JSONDecodeError:
+                pass
+            try:
+                return _json_lenient_loads(block)
+            except json.JSONDecodeError:
+                pass
 
     # 3. Brace slice
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
+        candidate = s[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return _json_lenient_loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # Replace the strict-only old return path with no-op so we
+        # fall through to the raise below — the lenient pass above
+        # already covered the previous behavior.
         try:
             return json.loads(s[start : end + 1])
         except json.JSONDecodeError:
