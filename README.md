@@ -7,6 +7,21 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.16.0** — **Lenient judge JSON parser**. Caught from a real
+polish_resume run: a sonnet judge emitted a valid-looking fenced
+``action="redo_P"`` JSON that the strict ``json.loads`` rejected
+because of a trailing comma, and the framework silently fell back to
+``action="stop"`` — overriding the model's actual judgment. v0.16
+adds a ``_json_lenient_loads`` relaxation pass (smart quotes →
+ASCII, trailing commas stripped, single-quoted keys converted) that
+runs after the strict parse fails on both fence and brace-slice
+paths, plus a 4-backtick fence variant (``` ```` json ```) matching
+the v0.13 workspace extractor. Well-formed JSON is still parsed
+strictly; only previously-unrecoverable output now survives. 343
+tests pass (10 new — both fence widths, trailing commas in objects
+and nested arrays, smart-quote normalisation, prose-wrapped sonnet
+fence, brace-slice fallback, genuinely-unparseable still raising).
+
 **v0.15.0** — **Multi-file best snapshot** (`workspace/best/` + manifest).
 Closes the long-standing rollback flaw where multi-file tasks
 (manuscript + SI + refs, task.md + rubric.json, etc.) lost everything
