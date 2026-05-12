@@ -7,6 +7,27 @@ LLM (Claude / GPT / Gemini / local), with regression-proof rollback and resumabl
 
 ## Status
 
+**v0.15.0** — **Multi-file best snapshot** (`workspace/best/` + manifest).
+Closes the long-standing rollback flaw where multi-file tasks
+(manuscript + SI + refs, task.md + rubric.json, etc.) lost everything
+but `solution.py` when judge rolled back a regressed cycle. Promote
+now snapshots every top-level workspace file into `workspace/best/`
+through an atomic `.best.tmp` directory + rename, writes a
+`best_manifest.json` recording score / cycle / timestamp / primary
+entrypoint and per-file size + sha256, and excludes
+`best/`/`.best.tmp`/`__pycache__`/symlinks/legacy `best_solution.py`
+from the snapshot. Rollback clears the current top-level workspace
+files and restores from `best/`, so a regress truly returns the task
+to its prior best state instead of leaking stale outputs. Falls
+through to the legacy `best_solution.py` copy when no `best/`
+directory is present (pre-v0.15 task dirs unchanged). The v0.13
+stage cleanup preserves both `best/` and `.best.tmp` so a
+half-written snapshot is never deleted mid-recovery. Live verified
+on `cursor/composer-2`: `best_manifest.json` (score 1.0, cycle 1)
+plus 3 snapshot files written, atomic rename completed (no
+`.best.tmp` left), legacy `best_solution.py` preserved alongside.
+333 tests pass (7 new).
+
 **v0.14.0** — **Multi-searcher Research** (searcher / consolidator
 pattern). The Research phase now mirrors what v0.3 did for Plan/Judge
 and v0.13 did for Implement: when ``runtime.researchers`` is set in
