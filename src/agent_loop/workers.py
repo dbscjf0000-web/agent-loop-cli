@@ -1224,7 +1224,10 @@ def run_implement(task_dir: TaskDir, config: Config) -> ModelResponse:
     # (any extension; multi-file tasks may produce multiple bests in the
     # future) + __pycache__/. Everything else is deleted.
     _PRESERVE_PREFIXES = ("best_solution",)
-    _PRESERVE_DIRS = {"__pycache__"}
+    # v0.15 — preserve the multi-file best snapshot directory (and its
+    # half-written tmp during a crash recovery window) alongside the
+    # legacy best_solution.py file.
+    _PRESERVE_DIRS = {"__pycache__", "best", ".best.tmp"}
     for entry in ws.iterdir():
         try:
             # Codex review fix B: symlinks first — a symlink whose target is

@@ -380,16 +380,116 @@ class Orchestrator:
         obj = self.task_dir.read_artifact("judge_result.json")
         return obj if isinstance(obj, dict) else {}
 
+    # v0.15 multi-file best snapshot config.
+    # Excluded from the snapshot: framework-owned dirs/files that aren't
+    # part of the task's output (best/ itself, caches, prior legacy file).
+    _BEST_DIR_NAME = "best"
+    _BEST_MANIFEST = "best_manifest.json"
+    _BEST_TMP_NAME = ".best.tmp"
+    _BEST_EXCLUDE = {"best", ".best.tmp", "__pycache__", "best_solution.py"}
+
     def _promote_to_best(self) -> None:
         if not self.task_dir.has_artifact("solution.json"):
             return
         sol = self.task_dir.read_artifact("solution.json")
         if isinstance(sol, dict):
             self.task_dir.write_artifact("best_solution.json", sol)
-        # snapshot the workspace solution file as well
-        sol_py = self.task_dir.workspace_path() / "solution.py"
+        # Legacy single-file snapshot (kept for backward-compat with MCP
+        # resources / README examples / older bench scripts).
+        ws = self.task_dir.workspace_path()
+        sol_py = ws / "solution.py"
         if sol_py.exists():
-            shutil.copy2(sol_py, self.task_dir.workspace_path() / "best_solution.py")
+            shutil.copy2(sol_py, ws / "best_solution.py")
+
+        # v0.15 — snapshot every workspace file (multi-file tasks) into
+        # ``workspace/best/`` atomically via a temp dir + rename so a
+        # crash mid-copy can't corrupt the previous best.
+        self._snapshot_workspace_to_best(sol if isinstance(sol, dict) else {})
+
+    def _snapshot_workspace_to_best(self, sol_payload: dict[str, Any]) -> None:
+        import hashlib
+        import os as _os
+        import time as _time
+
+        ws = self.task_dir.workspace_path()
+        tmp_dir = ws / self._BEST_TMP_NAME
+        best_dir = ws / self._BEST_DIR_NAME
+
+        # Clear any half-written tmp from a previous crash.
+        if tmp_dir.exists():
+            try:
+                shutil.rmtree(tmp_dir)
+            except OSError:
+                pass
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=False)
+        except OSError as exc:
+            self.console.print(f"[yellow]best snapshot tmp mkdir failed: {exc}[/yellow]")
+            return
+
+        files_meta: list[dict[str, Any]] = []
+        for entry in sorted(ws.iterdir()):
+            if entry.name in self._BEST_EXCLUDE:
+                continue
+            if entry.is_symlink():
+                # never follow — would let symlinks escape the snapshot
+                continue
+            if entry.is_dir():
+                # v0.15 keeps the snapshot flat (top-level files only) so the
+                # manifest stays simple; nested artifacts can be added later.
+                continue
+            try:
+                shutil.copy2(entry, tmp_dir / entry.name)
+            except OSError as exc:
+                self.console.print(
+                    f"[yellow]best snapshot: failed to copy {entry.name} ({exc})[/yellow]"
+                )
+                continue
+            try:
+                data = entry.read_bytes()
+                files_meta.append({
+                    "name": entry.name,
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                })
+            except OSError:
+                files_meta.append({"name": entry.name, "size": -1, "sha256": ""})
+
+        manifest = {
+            "score": sol_payload.get("weighted_score") or sol_payload.get("score"),
+            "summary": sol_payload.get("summary"),
+            "cycle": self._current_cycle_from_checkpoints(),
+            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "files": files_meta,
+            "primary": "solution.py" if any(f["name"] == "solution.py" for f in files_meta) else (
+                files_meta[0]["name"] if files_meta else None
+            ),
+        }
+        import json as _json
+        (tmp_dir / self._BEST_MANIFEST).write_text(
+            _json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Atomic swap: delete old best/, rename tmp to best/.
+        if best_dir.exists():
+            try:
+                shutil.rmtree(best_dir)
+            except OSError as exc:
+                self.console.print(f"[yellow]best swap rmtree failed: {exc}[/yellow]")
+                return
+        try:
+            _os.rename(tmp_dir, best_dir)
+        except OSError as exc:
+            self.console.print(f"[yellow]best swap rename failed: {exc}[/yellow]")
+
+    def _current_cycle_from_checkpoints(self) -> int:
+        cp = self.task_dir.load_latest_checkpoint()
+        if not cp:
+            return 0
+        try:
+            return int(cp.get("cycle", 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _rollback_to_best(self) -> None:
         if not self.task_dir.has_artifact("best_solution.json"):
@@ -397,8 +497,43 @@ class Orchestrator:
         best = self.task_dir.read_artifact("best_solution.json")
         if isinstance(best, dict):
             self.task_dir.write_artifact("solution.json", best)
-        best_py = self.task_dir.workspace_path() / "best_solution.py"
-        sol_py = self.task_dir.workspace_path() / "solution.py"
+
+        ws = self.task_dir.workspace_path()
+        best_dir = ws / self._BEST_DIR_NAME
+
+        # v0.15 multi-file rollback: if a best/ snapshot exists, clear the
+        # current top-level workspace files (except best/ itself + legacy
+        # best_solution.py) and restore from best/.
+        if best_dir.is_dir():
+            for entry in ws.iterdir():
+                if entry.name in self._BEST_EXCLUDE:
+                    continue
+                if entry.is_symlink():
+                    try:
+                        entry.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if entry.is_dir():
+                    continue
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+            for src in best_dir.iterdir():
+                if src.name == self._BEST_MANIFEST:
+                    continue
+                try:
+                    shutil.copy2(src, ws / src.name)
+                except OSError as exc:
+                    self.console.print(
+                        f"[yellow]best rollback: failed to restore {src.name} ({exc})[/yellow]"
+                    )
+            return
+
+        # Legacy single-file fallback (pre-v0.15 best_solution.py).
+        best_py = ws / "best_solution.py"
+        sol_py = ws / "solution.py"
         if best_py.exists():
             shutil.copy2(best_py, sol_py)
 
